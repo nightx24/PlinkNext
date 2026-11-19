@@ -1,0 +1,11 @@
+PocketLink Device & Storage Checklist
+=====================================
+
+[x] Local Native API Server (127.0.0.1:8000)
+[x] Local SAF Bridge Server (127.0.0.1:8765)
+[x] Writable App Storage (PocketLinkStorage)
+[x] Media Index Scanner (Music, Videos, Photos)
+[x] System Telemetry Reader (CPU, RAM, Storage, Battery)
+[ ] Optional: Grant All Files Access in Host Setup for full device storage
+[ ] Optional: Attach external USB SSD or SAF folder
+[ ] Optional: Connect from another phone over Tailscale (100.x.y.z:8000)

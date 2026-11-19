@@ -1,0 +1,6 @@
+{
+  "name": "PocketLink",
+  "description": "Self-hosted Android file, USB/SSD storage, and original media streaming hub over Tailscale or loopback.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

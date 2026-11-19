@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+        Android's XML domain-config cannot represent CIDR ranges such as Tailscale's
+        100.64.0.0/10 or fd7a:115c:a1e0::/48. Cleartext HTTP is therefore permitted
+        at the platform layer and strictly restricted in PocketLinkApi (client) and
+        NetworkAccessPolicy (host) to loopback and Tailscale addresses only.
+    -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
