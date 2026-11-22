@@ -23,18 +23,22 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowForwardIos
 import androidx.compose.material.icons.rounded.BugReport
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Language
+import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.PhoneAndroid
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.SettingsEthernet
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.AlertDialog
@@ -85,16 +89,26 @@ import com.example.ui.theme.CyanAccent
 import com.example.ui.theme.IndigoPrimary
 import com.example.ui.theme.LocalPocketLinkColors
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.material.icons.rounded.Cloud
+import androidx.compose.material.icons.rounded.CloudDone
+import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.ContentPaste
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.VpnLock
 import androidx.compose.material.icons.rounded.WarningAmber
+import androidx.compose.material3.Switch
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import io.github.augztn.pocketlink.ssdbridge.LocalHostController
 import io.github.augztn.pocketlink.ssdbridge.LocalHostStatus
+import io.github.augztn.pocketlink.ssdbridge.tunnel.CloudflareTunnelConfig
+import io.github.augztn.pocketlink.ssdbridge.tunnel.TunnelState
+import io.github.augztn.pocketlink.ssdbridge.tunnel.TunnelStatusSnapshot
+import io.github.augztn.pocketlink.ssdbridge.tunnel.buildPocketLinkConnectUri
+import io.github.augztn.pocketlink.ssdbridge.tunnel.parsePocketLinkConnectInput
 import kotlinx.coroutines.delay
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -102,13 +116,21 @@ import kotlinx.coroutines.delay
 fun ConnectionScreen(
     connectionState: ConnectionUiState,
     hostStatus: LocalHostStatus,
+    tunnelStatus: TunnelStatusSnapshot = TunnelStatusSnapshot(),
+    tunnelConfig: CloudflareTunnelConfig = CloudflareTunnelConfig(),
+    ytStreamingEnabled: Boolean = true,
     onConnect: (name: String, host: String, port: String, username: String, password: String, profileId: String?) -> Unit,
     onQuickStartLocal: () -> Unit,
+    onToggleCloudflareTunnel: (Boolean) -> Unit = {},
     onDeleteProfile: (String) -> Unit,
     onOpenHostSetup: () -> Unit,
+    onOpenYtMusic: () -> Unit = {},
+    onOpenYtSettings: () -> Unit = {},
+    onOpenSettings: () -> Unit = {},
     onOpenDiagnostics: () -> Unit,
     onOpenAbout: () -> Unit,
     onRefreshHostStatus: () -> Unit = {},
+    onClearError: () -> Unit = {},
 ) {
     var serverName by rememberSaveable { mutableStateOf("") }
     var address by rememberSaveable { mutableStateOf("") }
@@ -116,6 +138,7 @@ fun ConnectionScreen(
     var username by rememberSaveable { mutableStateOf("admin") }
     var password by rememberSaveable { mutableStateOf("") }
     var obscurePassword by rememberSaveable { mutableStateOf(true) }
+    var pasteNotice by remember { mutableStateOf<String?>(null) }
     var profileToDelete by remember { mutableStateOf<ServerProfile?>(null) }
     var showTailscaleGuide by rememberSaveable { mutableStateOf(false) }
 
@@ -175,6 +198,9 @@ fun ConnectionScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = onOpenSettings, modifier = Modifier.testTag("connection_settings_btn")) {
+                        Icon(Icons.Rounded.Settings, contentDescription = "Settings")
+                    }
                     IconButton(onClick = onOpenDiagnostics, modifier = Modifier.testTag("connection_diagnostics_btn")) {
                         Icon(Icons.Rounded.BugReport, contentDescription = "Diagnostics")
                     }
@@ -246,6 +272,94 @@ fun ConnectionScreen(
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 }
+                            }
+                        }
+                    }
+                }
+
+                if (tunnelStatus.isActive || tunnelConfig.isReadyToStart) {
+                    item {
+                        val colors = LocalPocketLinkColors.current
+                        val isLive = tunnelStatus.state == TunnelState.CONNECTED
+                        val publicUrl = tunnelStatus.publicUrl?.takeIf { it.isNotBlank() }
+                            ?: tunnelConfig.activePublicUrl
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(18.dp))
+                                .clickable {
+                                    if (publicUrl.isNotBlank()) {
+                                        address = publicUrl
+                                        port = "443"
+                                        if (serverName.isBlank()) serverName = "PocketLink Cloud"
+                                    }
+                                }
+                                .testTag("cloudflare_active_banner"),
+                            color = if (isLive) colors.cloudflare.copy(alpha = 0.12f)
+                            else MaterialTheme.colorScheme.surfaceContainerLow,
+                            shape = RoundedCornerShape(18.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .border(
+                                        1.dp,
+                                        if (isLive) colors.cloudflare.copy(alpha = 0.45f) else colors.cardBorder,
+                                        RoundedCornerShape(18.dp),
+                                    )
+                                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                Icon(
+                                    imageVector = if (isLive) Icons.Rounded.CloudDone else Icons.Rounded.Cloud,
+                                    contentDescription = null,
+                                    tint = if (isLive) colors.cloudflare else MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = when (tunnelStatus.state) {
+                                            TunnelState.CONNECTED -> "Cloudflare Tunnel · Online"
+                                            TunnelState.CONNECTING -> "Cloudflare Tunnel · Connecting…"
+                                            TunnelState.ERROR -> "Cloudflare Tunnel · Error"
+                                            TunnelState.STOPPED -> "Cloudflare Tunnel · Off"
+                                        },
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = if (isLive) colors.cloudflare else MaterialTheme.colorScheme.onSurface,
+                                        fontWeight = FontWeight.Bold,
+                                    )
+                                    if (publicUrl.isNotBlank()) {
+                                        Text(
+                                            text = publicUrl,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                }
+                                if (publicUrl.isNotBlank()) {
+                                    IconButton(
+                                        onClick = {
+                                            val link = buildPocketLinkConnectUri(publicUrl, "admin", "PocketLink Cloud")
+                                            val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                            cm.setPrimaryClip(android.content.ClipData.newPlainText("PocketLink Connect Link", link))
+                                            pasteNotice = "Copied client connect link"
+                                        },
+                                        modifier = Modifier.size(40.dp),
+                                    ) {
+                                        Icon(
+                                            Icons.Rounded.ContentCopy,
+                                            contentDescription = "Copy Cloudflare Client Connect Link",
+                                            tint = colors.cloudflare,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                    }
+                                }
+                                Switch(
+                                    checked = tunnelStatus.isActive,
+                                    onCheckedChange = onToggleCloudflareTunnel,
+                                    modifier = Modifier.testTag("connection_cf_quick_switch"),
+                                )
                             }
                         }
                     }
@@ -376,7 +490,7 @@ fun ConnectionScreen(
                             )
                             Spacer(Modifier.height(6.dp))
                             Text(
-                                text = "Access your internal storage, USB SSDs, and original media over Tailscale or loopback.",
+                                text = "Access your internal storage, USB SSDs, and original media over Cloudflare HTTPS Tunnel, Tailscale, or loopback.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 textAlign = TextAlign.Center,
@@ -387,6 +501,47 @@ fun ConnectionScreen(
 
                 item {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(
+                                text = "Quick paste from Host",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            TextButton(
+                                onClick = {
+                                    val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                    val clipText = cm.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+                                    val parsed = parsePocketLinkConnectInput(clipText)
+                                    if (parsed != null) {
+                                        address = parsed.host
+                                        port = parsed.port
+                                        parsed.username?.let { username = it }
+                                        parsed.serverName?.let { serverName = it }
+                                        pasteNotice = "Filled ${parsed.host} (Port ${parsed.port}) — enter password & connect"
+                                    } else {
+                                        pasteNotice = "Copy a Cloudflare URL, pocketlink:// link, or Tailscale IP from your Host first."
+                                    }
+                                },
+                                modifier = Modifier.testTag("connection_paste_link_btn"),
+                            ) {
+                                Icon(Icons.Rounded.ContentPaste, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Paste Link / URL", fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        pasteNotice?.let { note ->
+                            Text(
+                                text = note,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+
                         OutlinedTextField(
                             value = serverName,
                             onValueChange = { serverName = it },
@@ -405,9 +560,31 @@ fun ConnectionScreen(
                         ) {
                             OutlinedTextField(
                                 value = address,
-                                onValueChange = { address = it },
+                                onValueChange = { next ->
+                                    val parsed = if (next.startsWith("pocketlink://", ignoreCase = true)) {
+                                        parsePocketLinkConnectInput(next)
+                                    } else null
+                                    if (parsed != null) {
+                                        address = parsed.host
+                                        port = parsed.port
+                                        parsed.username?.let { username = it }
+                                        parsed.serverName?.let { serverName = it }
+                                    } else {
+                                        address = next
+                                        val lower = next.trim().lowercase()
+                                        val isHttpsOrCf = lower.startsWith("https://") ||
+                                            lower.contains(".workers.dev") ||
+                                            lower.contains(".trycloudflare.com") ||
+                                            lower.contains(".cfargotunnel.com")
+                                        if (isHttpsOrCf && port == "8000") {
+                                            port = "443"
+                                        } else if ((lower.startsWith("127.") || lower.startsWith("100.")) && port == "443") {
+                                            port = "8000"
+                                        }
+                                    }
+                                },
                                 label = { Text("Server address") },
-                                placeholder = { Text("100.x.y.z or 127.0.0.1") },
+                                placeholder = { Text("https://….workers.dev, 100.x.y.z, or 127.0.0.1") },
                                 leadingIcon = { Icon(Icons.Rounded.Language, contentDescription = null) },
                                 singleLine = true,
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
@@ -487,18 +664,47 @@ fun ConnectionScreen(
                             }
                         }
 
-                        if (!connectionState.errorMessage.isNullOrBlank()) {
+                        AnimatedVisibility(visible = !connectionState.errorMessage.isNullOrBlank()) {
                             Surface(
                                 color = MaterialTheme.colorScheme.error.copy(alpha = 0.12f),
                                 shape = RoundedCornerShape(14.dp),
-                                modifier = Modifier.fillMaxWidth(),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .border(
+                                        1.dp,
+                                        MaterialTheme.colorScheme.error.copy(alpha = 0.28f),
+                                        RoundedCornerShape(14.dp),
+                                    ),
                             ) {
-                                Text(
-                                    text = connectionState.errorMessage,
-                                    color = MaterialTheme.colorScheme.error,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    modifier = Modifier.padding(12.dp),
-                                )
+                                Row(
+                                    modifier = Modifier.padding(start = 12.dp, top = 8.dp, bottom = 8.dp, end = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.WarningAmber,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                    Text(
+                                        text = connectionState.errorMessage.orEmpty(),
+                                        color = MaterialTheme.colorScheme.error,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    IconButton(
+                                        onClick = onClearError,
+                                        modifier = Modifier.size(36.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Close,
+                                            contentDescription = "Dismiss error",
+                                            tint = MaterialTheme.colorScheme.error,
+                                            modifier = Modifier.size(16.dp),
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -579,6 +785,72 @@ fun ConnectionScreen(
                 }
 
                 item {
+                    val colors = LocalPocketLinkColors.current
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(20.dp))
+                            .clickable(onClick = if (ytStreamingEnabled) onOpenYtMusic else onOpenYtSettings)
+                            .testTag("connection_yt_music_card"),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
+                        shape = RoundedCornerShape(20.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .border(
+                                    1.dp,
+                                    if (ytStreamingEnabled) colors.violet.copy(alpha = 0.35f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f),
+                                    RoundedCornerShape(20.dp),
+                                )
+                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .clip(RoundedCornerShape(15.dp))
+                                    .background(colors.violet.copy(alpha = 0.14f)),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.LibraryMusic,
+                                    contentDescription = null,
+                                    tint = colors.violet,
+                                )
+                            }
+                            Spacer(Modifier.width(14.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = if (ytStreamingEnabled) "Discover" else "Discover (Off)",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                                Spacer(Modifier.height(3.dp))
+                                Text(
+                                    text = if (ytStreamingEnabled) {
+                                        "Stream directly via NewPipe without a host server · charts, search & synced lyrics."
+                                    } else {
+                                        "Turned off in Settings · tap to enable or customize Discover."
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            IconButton(
+                                onClick = onOpenYtSettings,
+                                modifier = Modifier.size(48.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Tune,
+                                    contentDescription = "Discover settings",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+
+                item {
                     Card(
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
                         shape = RoundedCornerShape(18.dp),
@@ -593,7 +865,7 @@ fun ConnectionScreen(
                                 Icon(Icons.Rounded.VpnLock, contentDescription = null, tint = IndigoPrimary, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(8.dp))
                                 Text(
-                                    "How to connect 2 devices with Tailscale",
+                                    "How to connect via Cloudflare Tunnel or Tailscale",
                                     style = MaterialTheme.typography.titleSmall,
                                     fontWeight = FontWeight.SemiBold,
                                     modifier = Modifier.weight(1f),
@@ -609,17 +881,12 @@ fun ConnectionScreen(
                                     verticalArrangement = Arrangement.spacedBy(6.dp),
                                 ) {
                                     Text(
-                                        "1. Open the Tailscale app on BOTH phones, turn VPN ON, and sign in with the same Tailscale account.",
+                                        "Cloudflare Tunnel (HTTPS anywhere — no VPN needed): On the HOST phone open \"Host PocketLink on this device\", configure Cloudflare Tunnel (Built-in Edge Worker or Zero Trust), tap Start Tunnel, then enter the https:// URL here (Port 443, Username admin, Host password).",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                     Text(
-                                        "2. On the HOST phone (the phone sharing its storage): tap \"Host PocketLink on this device\", set/copy the password, tap Start server, and copy its Tailscale IP (100.x.y.z).",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                    Text(
-                                        "3. On THIS CLIENT phone: enter the HOST phone's 100.x.y.z IP in Server address (Port 8000, Username admin, and the Host password).",
+                                        "Tailscale VPN: Turn on Tailscale on BOTH phones with the same account, start the server on the HOST phone, then enter its 100.x.y.z IP here (Port 8000, Username admin, Host password).",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )

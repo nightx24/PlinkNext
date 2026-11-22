@@ -56,8 +56,9 @@ android {
     }
   }
   compileOptions {
-    sourceCompatibility = JavaVersion.VERSION_11
-    targetCompatibility = JavaVersion.VERSION_11
+    isCoreLibraryDesugaringEnabled = true
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
   }
   buildFeatures {
     compose = true
@@ -103,10 +104,12 @@ dependencies {
   implementation(libs.androidx.lifecycle.runtime.compose)
   implementation(libs.androidx.lifecycle.runtime.ktx)
   implementation(libs.androidx.lifecycle.viewmodel.compose)
-  implementation(libs.androidx.media)
+  // implementation(libs.androidx.media)
   implementation(libs.androidx.media3.common)
   implementation(libs.androidx.media3.datasource.okhttp)
   implementation(libs.androidx.media3.exoplayer)
+  implementation(libs.androidx.media3.exoplayer.hls)
+  implementation(libs.androidx.media3.session)
   implementation(libs.androidx.media3.ui)
   implementation(libs.androidx.navigation.compose)
   // implementation(libs.androidx.room.ktx)
@@ -130,7 +133,9 @@ dependencies {
   implementation(libs.logging.interceptor)
   // implementation(libs.moshi.kotlin)
   implementation(libs.nanohttpd)
+  implementation(libs.newpipe.extractor)
   implementation(libs.okhttp)
+  coreLibraryDesugaring(libs.desugar.jdk.libs.nio)
   // implementation(libs.play.services.location)
   // implementation(libs.retrofit)
   testImplementation(libs.androidx.compose.ui.test.junit4)

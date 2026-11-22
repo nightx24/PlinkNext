@@ -20,10 +20,12 @@ import java.io.FileInputStream
 import java.io.BufferedInputStream
 import java.io.FilterInputStream
 import java.text.SimpleDateFormat
+import java.util.Collections
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
+import java.util.concurrent.Executors
 import android.util.Base64
 
 /**
@@ -39,11 +41,33 @@ internal class NativeApiServer(
     bindHost: String? = null
 ) : NanoHTTPD(bindHost, listenPort) {
     private val prefs = context.getSharedPreferences("ssd-bridge", Context.MODE_PRIVATE)
+    private val httpExecutor = Executors.newCachedThreadPool { runnable ->
+        Thread(runnable, "PocketLink-HTTP").apply { isDaemon = true }
+    }
     private val systemTelemetry by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         SystemTelemetryReader(context)
     }
     private val scopedStorage by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         ScopedStorageRegistry(context)
+    }
+
+    init {
+        setAsyncRunner(object : AsyncRunner {
+            private val running = Collections.synchronizedList(mutableListOf<ClientHandler>())
+
+            override fun closeAll() {
+                running.toList().forEach { runCatching { it.close() } }
+            }
+
+            override fun closed(clientHandler: ClientHandler) {
+                running.remove(clientHandler)
+            }
+
+            override fun exec(code: ClientHandler) {
+                running.add(code)
+                httpExecutor.execute(code)
+            }
+        })
     }
 
     private fun resolveInternalRoot(): File =
@@ -85,6 +109,7 @@ internal class NativeApiServer(
 
     override fun stop() {
         super.stop()
+        runCatching { httpExecutor.shutdownNow() }
         if (mediaIndexDelegate.isInitialized()) {
             runCatching { mediaIndex.close() }
         }
@@ -175,7 +200,16 @@ internal class NativeApiServer(
                             .put("size", item.size)
                             .put("modified", isoDate(item.modified))
                             .put("mime", item.mime)
-                            .put("category", item.category))
+                            .put("category", item.category)
+                            .apply {
+                                if (!item.title.isNullOrBlank()) put("title", item.title)
+                                if (!item.artist.isNullOrBlank()) put("artist", item.artist)
+                                if (!item.album.isNullOrBlank()) put("album", item.album)
+                                if (item.durationMs > 0L) put("duration_ms", item.durationMs)
+                                if (item.sampleRateHz > 0) put("sample_rate", item.sampleRateHz)
+                                if (item.bitDepth > 0) put("bit_depth", item.bitDepth)
+                                if (item.hasLyrics) put("has_lyrics", true)
+                            })
                     }
                     json(JSONObject().put("items", items).put("status", mediaIndex.status()))
                 }
@@ -200,6 +234,8 @@ internal class NativeApiServer(
                     videoMetadata(query["volume"], path)
                 session.uri == "/api/media/thumbnail" && session.method == Method.GET ->
                     videoThumbnail(query["volume"], path)
+                session.uri == "/api/media/lyrics" && session.method == Method.GET ->
+                    audioLyrics(query["volume"], path)
                 else -> jsonError(Response.Status.NOT_FOUND, "Endpoint not found")
             }
         } catch (error: SecurityException) {
@@ -736,6 +772,48 @@ internal class NativeApiServer(
         }
     }
 
+    private fun audioLyrics(volume: String?, relative: String): Response {
+        if (relative.isBlank()) return bad("Audio path is required")
+        return try {
+            val meta = if (volume.isNullOrBlank() || volume == "internal") {
+                when (val resolved = scopedStorage.resolveReadable(relative)) {
+                    is InternalReadable.LocalFile ->
+                        AudioMetadataExtractor.extractFromFile(resolved.file, includeLyrics = true)
+                    is InternalReadable.SafDoc ->
+                        AudioMetadataExtractor.extractFromUri(context, resolved.doc.uri, resolved.name, resolved.doc.length(), includeLyrics = true)
+                    is InternalReadable.ContentItem ->
+                        AudioMetadataExtractor.extractFromUri(context, resolved.uri, resolved.name, resolved.size, includeLyrics = true)
+                    null -> return notFound("Audio file not found")
+                }
+            } else {
+                val root = externalRoot(volume) ?: return notFound("Storage permission not granted")
+                val document = resolveDocument(root, relative) ?: return notFound("Audio file not found")
+                if (!document.isFile) return bad("Not an audio file")
+                AudioMetadataExtractor.extractFromUri(
+                    context,
+                    document.uri,
+                    document.name.orEmpty(),
+                    document.length(),
+                    includeLyrics = true,
+                )
+            }
+            val lyrics = meta.embeddedLyrics?.takeIf { it.isNotBlank() }
+                ?: return notFound("No embedded or sidecar lyrics found")
+            json(
+                JSONObject()
+                    .put("lyrics", lyrics)
+                    .put("source", meta.source.ifBlank { "Embedded" })
+                    .put("title", meta.title)
+                    .put("artist", meta.artist)
+                    .put("album", meta.album)
+            )
+        } catch (_: SecurityException) {
+            jsonError(Response.Status.FORBIDDEN, "Storage permission was revoked")
+        } catch (_: Exception) {
+            notFound("Audio lyrics unavailable")
+        }
+    }
+
     private fun videoMetadata(volume: String?, relative: String): Response =
         withVideoSource(volume, relative) { retriever ->
             val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
@@ -889,7 +967,7 @@ internal class NativeApiServer(
 
     private fun parseRange(value: String, length: Long): Pair<Long, Long>? {
         if (length <= 0L) return null
-        val match = Regex("bytes=(\\d*)-(\\d*)").matchEntire(value) ?: return null
+        val match = Regex("bytes=(\\d*)-(\\d*)", RegexOption.IGNORE_CASE).matchEntire(value.trim()) ?: return null
         val first = match.groupValues[1]
         val last = match.groupValues[2]
         val start: Long
@@ -919,8 +997,9 @@ internal class NativeApiServer(
 
     private fun mimeFor(name: String): String = when (name.substringAfterLast('.', "").lowercase(Locale.ROOT)) {
         "jpg", "jpeg" -> "image/jpeg"; "png" -> "image/png"; "gif" -> "image/gif"; "webp" -> "image/webp"
-        "mp3" -> "audio/mpeg"; "m4a" -> "audio/mp4"; "mp4" -> "video/mp4"; "aac" -> "audio/aac"
+        "mp3" -> "audio/mpeg"; "m4a", "alac" -> "audio/mp4"; "mp4" -> "video/mp4"; "aac" -> "audio/aac"
         "flac" -> "audio/flac"; "ogg", "opus" -> "audio/ogg"; "wav" -> "audio/wav"
+        "aiff", "aif" -> "audio/aiff"; "wv" -> "audio/x-wavpack"; "ape" -> "audio/x-ape"; "dsf", "dff" -> "audio/dsd"
         "mkv" -> "video/x-matroska"; "pdf" -> "application/pdf"; "txt" -> "text/plain"
         else -> "application/octet-stream"
     }

@@ -34,6 +34,7 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowForward
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.Headphones
+import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.Search
@@ -74,6 +75,8 @@ private data class ExploreCardItem(
 
 @Composable
 fun ExploreScreen(
+    showYtMusic: Boolean = false,
+    onOpenYtMusic: () -> Unit = {},
     onOpenPhotos: () -> Unit,
     onOpenMusic: () -> Unit,
     onOpenVideos: () -> Unit,
@@ -86,15 +89,18 @@ fun ExploreScreen(
     var revealed by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { revealed = true }
 
-    val cards = listOf(
-        ExploreCardItem("photos", "Photos", "Picture gallery & favorites", Icons.Rounded.PhotoLibrary, colors.amber, onOpenPhotos),
-        ExploreCardItem("music", "Music", "Albums, playlists & audio", Icons.Rounded.Headphones, colors.violet, onOpenMusic),
-        ExploreCardItem("videos", "Videos", "Movies & camera clips", Icons.Rounded.PlayCircle, colors.teal, onOpenVideos),
-        ExploreCardItem("documents", "Documents", "PDF, Office & text files", Icons.Rounded.Description, colors.sky, onOpenDocuments),
-        ExploreCardItem("files", "Files", "Browse server folders", Icons.Rounded.Folder, MaterialTheme.colorScheme.primary, onOpenFiles),
-        ExploreCardItem("search", "Search", "Find across all storage", Icons.Rounded.Search, colors.cyan, onOpenSearch),
-        ExploreCardItem("drives", "Drives", "Internal & USB drives", Icons.Rounded.Usb, colors.emerald, onOpenDrives),
-    )
+    val cards = buildList {
+        if (showYtMusic) {
+            add(ExploreCardItem("yt_music", "Discover", "Stream via NewPipe · charts & lyrics", Icons.Rounded.LibraryMusic, colors.violet, onOpenYtMusic))
+        }
+        add(ExploreCardItem("photos", "Photos", "Picture gallery & favorites", Icons.Rounded.PhotoLibrary, colors.amber, onOpenPhotos))
+        add(ExploreCardItem("music", "Music", "Albums, playlists & audio", Icons.Rounded.Headphones, colors.violet, onOpenMusic))
+        add(ExploreCardItem("videos", "Videos", "Movies & camera clips", Icons.Rounded.PlayCircle, colors.teal, onOpenVideos))
+        add(ExploreCardItem("documents", "Documents", "PDF, Office & text files", Icons.Rounded.Description, colors.sky, onOpenDocuments))
+        add(ExploreCardItem("files", "Files", "Browse server folders", Icons.Rounded.Folder, MaterialTheme.colorScheme.primary, onOpenFiles))
+        add(ExploreCardItem("search", "Search", "Find across all storage", Icons.Rounded.Search, colors.cyan, onOpenSearch))
+        add(ExploreCardItem("drives", "Drives", "Internal & USB drives", Icons.Rounded.Usb, colors.emerald, onOpenDrives))
+    }
 
     Scaffold(
         topBar = {

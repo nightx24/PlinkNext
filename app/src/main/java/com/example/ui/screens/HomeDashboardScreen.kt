@@ -59,6 +59,7 @@ import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Headphones
 import androidx.compose.material.icons.rounded.History
+import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.LightMode
 import androidx.compose.material.icons.rounded.ManageSearch
 import androidx.compose.material.icons.rounded.Memory
@@ -141,6 +142,8 @@ import com.example.ui.components.RouteBadge
 import com.example.ui.components.rememberPressScaleModifier
 import com.example.ui.theme.LocalPocketLinkColors
 import com.example.ui.theme.LocalPocketLinkDarkTheme
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -161,6 +164,7 @@ fun HomeDashboardScreen(
     onOpenFiles: (volume: String?, path: String) -> Unit,
     onOpenPhotos: (favoritesOnly: Boolean) -> Unit,
     onOpenMusic: () -> Unit,
+    onOpenYtMusic: () -> Unit = {},
     onOpenVideos: () -> Unit,
     onOpenDocuments: () -> Unit,
     onOpenSearch: () -> Unit,
@@ -190,9 +194,15 @@ fun HomeDashboardScreen(
     var renameTarget by remember { mutableStateOf<RecentFile?>(null) }
     var deleteTarget by remember { mutableStateOf<RecentFile?>(null) }
 
-    suspend fun loadAll() {
+    suspend fun loadAll() = coroutineScope {
         refreshing = true
-        runCatching { api.checkHealth() }
+        val healthDef = async { runCatching { api.checkHealth() } }
+        val telemetryDef = async { runCatching { api.systemTelemetry() } }
+        val volumesDef = async { runCatching { api.listStorageVolumes() } }
+        val indexDef = async { runCatching { api.mediaIndexStatus() } }
+        val recentDef = async { runCatching { api.listRecentFiles(limit = 8) } }
+
+        healthDef.await()
             .onSuccess { ms ->
                 online = true
                 latencyMs = ms
@@ -202,10 +212,10 @@ fun HomeDashboardScreen(
                 latencyMs = null
             }
         lastCheckedMs = System.currentTimeMillis()
-        runCatching { api.systemTelemetry() }.onSuccess { telemetry = it }
-        runCatching { api.listStorageVolumes() }.onSuccess { volumes = it }
-        runCatching { api.mediaIndexStatus() }.onSuccess { indexStatus = it }
-        runCatching { api.listRecentFiles(limit = 8) }.onSuccess { recentFiles = it }
+        telemetryDef.await().onSuccess { telemetry = it }
+        volumesDef.await().onSuccess { volumes = it }
+        indexDef.await().onSuccess { indexStatus = it }
+        recentDef.await().onSuccess { recentFiles = it }
         onHostSummaryChanged(online, latencyMs, telemetry, volumes)
         refreshing = false
     }
@@ -214,12 +224,16 @@ fun HomeDashboardScreen(
         loadAll()
         while (true) {
             delay(5000L)
-            runCatching { api.systemTelemetry() }.onSuccess {
-                telemetry = it
-                onHostSummaryChanged(online, latencyMs, telemetry, volumes)
-            }
-            if (indexStatus?.isScanning == true) {
-                runCatching { api.mediaIndexStatus() }.onSuccess { indexStatus = it }
+            coroutineScope {
+                val telDef = async { runCatching { api.systemTelemetry() } }
+                val idxDef = if (indexStatus?.isScanning == true) {
+                    async { runCatching { api.mediaIndexStatus() } }
+                } else null
+                telDef.await().onSuccess {
+                    telemetry = it
+                    onHostSummaryChanged(online, latencyMs, telemetry, volumes)
+                }
+                idxDef?.await()?.onSuccess { indexStatus = it }
             }
         }
     }
@@ -400,6 +414,7 @@ fun HomeDashboardScreen(
                                     onAction = { key ->
                                         when (key) {
                                             "upload" -> onUploadFiles()
+                                            "yt_music" -> onOpenYtMusic()
                                             "files" -> onOpenFiles(null, "")
                                             "drives" -> onOpenFiles(mountedVolumes.firstOrNull()?.id ?: "internal", "")
                                             "favorites" -> onOpenPhotos(true)
@@ -1140,6 +1155,7 @@ private fun QuickActionsSection(
                         val colors = LocalPocketLinkColors.current
                         val (label, icon, tint) = when (key) {
                             "upload" -> Triple("Upload", Icons.Rounded.CloudUpload, MaterialTheme.colorScheme.primary)
+                            "yt_music" -> Triple("Discover", Icons.Rounded.LibraryMusic, colors.violet)
                             "files" -> Triple("Files", Icons.Rounded.FolderOpen, colors.sky)
                             "drives" -> Triple("Drives", Icons.Rounded.Usb, colors.cyan)
                             "favorites" -> Triple("Favorites", Icons.Rounded.Favorite, colors.amber)
@@ -1370,6 +1386,10 @@ private fun QuickActionsEditDialog(
                 ) {
                     AppSettingsState.ALL_QUICK_ACTIONS.forEach { action ->
                         val selected = action in draft
+                        val chipLabel = when (action) {
+                            "yt_music" -> "Discover"
+                            else -> action.replaceFirstChar { it.uppercase() }
+                        }
                         FilterChip(
                             selected = selected,
                             onClick = {
@@ -1379,7 +1399,7 @@ private fun QuickActionsEditDialog(
                             leadingIcon = if (selected) {
                                 { Icon(Icons.Rounded.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp)) }
                             } else null,
-                            label = { Text(action.replaceFirstChar { it.uppercase() }) },
+                            label = { Text(chipLabel) },
                         )
                     }
                 }
@@ -1410,6 +1430,7 @@ fun HomeNavigationDrawerSheet(
     onOpenFiles: (volume: String?, path: String) -> Unit,
     onOpenPhotos: (favoritesOnly: Boolean) -> Unit,
     onOpenMusic: () -> Unit,
+    onOpenYtMusic: () -> Unit = {},
     onOpenVideos: () -> Unit,
     onOpenDocuments: () -> Unit,
     onOpenSearch: () -> Unit,
@@ -1585,6 +1606,18 @@ fun HomeNavigationDrawerSheet(
                             onOpenDocuments()
                         },
                         modifier = Modifier.weight(1f).testTag("drawer_quick_docs"),
+                    )
+                }
+                if (settings.ytStreamingEnabled) {
+                    DrawerQuickTile(
+                        icon = Icons.Rounded.LibraryMusic,
+                        label = "Discover",
+                        tint = colors.violet,
+                        onClick = {
+                            scope.launch { drawerState.close() }
+                            onOpenYtMusic()
+                        },
+                        modifier = Modifier.fillMaxWidth().testTag("drawer_quick_yt_music"),
                     )
                 }
             }

@@ -41,14 +41,19 @@ import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.LibraryMusic
+import androidx.compose.material.icons.rounded.Lyrics
 import androidx.compose.material.icons.rounded.MovieCreation
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.PhoneAndroid
 import androidx.compose.material.icons.rounded.Pinch
+import androidx.compose.material.icons.rounded.Public
+import androidx.compose.material.icons.rounded.QueueMusic
 import androidx.compose.material.icons.rounded.Reorder
 import androidx.compose.material.icons.rounded.RestartAlt
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.SwapVert
 import androidx.compose.material.icons.rounded.Timer
@@ -82,12 +87,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.AppSettingsState
 import com.example.data.model.AppThemeMode
 import com.example.data.model.NetworkRouteType
+import com.example.data.model.YtAudioQuality
 import com.example.ui.PocketLinkViewModel
 import com.example.ui.components.FloatingNavigationDock
 import com.example.ui.components.RouteBadge
@@ -898,6 +905,221 @@ internal fun VideoPlayerSettingsContent(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+internal fun YtStreamingSettingsContent(
+    viewModel: PocketLinkViewModel,
+    settings: AppSettingsState,
+    onMessage: (String) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    val colors = LocalPocketLinkColors.current
+    val enabled = settings.ytStreamingEnabled
+
+    LazyColumn(
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        item {
+            Surface(
+                color = (if (enabled) colors.violet else MaterialTheme.colorScheme.surfaceContainerHighest).copy(alpha = if (enabled) 0.14f else 0.7f),
+                shape = RoundedCornerShape(22.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(
+                        1.dp,
+                        if (enabled) colors.violet.copy(alpha = 0.36f) else colors.cardBorder,
+                        RoundedCornerShape(22.dp),
+                    ),
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    ToggleRow(
+                        icon = Icons.Rounded.LibraryMusic,
+                        iconTint = colors.violet,
+                        title = "Enable Discover Streaming",
+                        subtitle = if (enabled) {
+                            "Active · Powered by NewPipe Extractor with charts, search & synced lyrics"
+                        } else {
+                            "Turned off · Discover hubs & active Discover audio streams are disabled"
+                        },
+                        checked = enabled,
+                        switchTestTag = "yt_streaming_master_switch",
+                        onCheckedChange = { next ->
+                            scope.launch {
+                                viewModel.settingsRepository.updateYtStreamingOptions(enabled = next)
+                                onMessage(if (next) "Discover streaming enabled" else "Discover streaming disabled")
+                            }
+                        },
+                    )
+                }
+            }
+        }
+
+        item {
+            SettingsSectionCard(title = "Audio Stream Quality (Opus First)") {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        YtAudioQuality.entries.forEach { quality ->
+                            FilterChip(
+                                selected = settings.ytAudioQuality == quality,
+                                enabled = enabled,
+                                onClick = {
+                                    scope.launch {
+                                        viewModel.settingsRepository.updateYtStreamingOptions(audioQuality = quality)
+                                    }
+                                },
+                                label = { Text(quality.shortLabel) },
+                                modifier = Modifier.testTag("yt_quality_${quality.prefKey}"),
+                            )
+                        }
+                    }
+                    Text(
+                        text = "${settings.ytAudioQuality.label} — ${settings.ytAudioQuality.detail}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (settings.ytAudioQuality == YtAudioQuality.AUTO) {
+                        val effective = viewModel.ytMusicClient.effectiveAudioQuality()
+                        Text(
+                            text = "Active network tier: ${effective.shortLabel} (Opus prioritized when available)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = colors.teal,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
+            }
+        }
+
+        item {
+            SettingsSectionCard(title = "Playback & Experience") {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    ToggleRow(
+                        icon = Icons.Rounded.Lyrics,
+                        iconTint = colors.sky,
+                        title = "Synced lyrics (LRCLIB)",
+                        subtitle = "Fetch time-synced .lrc lyrics and tap lines to seek in Now Playing",
+                        checked = settings.ytLyricsEnabled,
+                        enabled = enabled,
+                        onCheckedChange = {
+                            scope.launch { viewModel.settingsRepository.updateYtStreamingOptions(lyricsEnabled = it) }
+                        },
+                    )
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+                    ToggleRow(
+                        icon = Icons.Rounded.QueueMusic,
+                        iconTint = colors.violet,
+                        title = "Auto-queue related radio",
+                        subtitle = "Automatically queue similar Discover tracks when starting a song",
+                        checked = settings.ytAutoQueueRelated,
+                        enabled = enabled,
+                        onCheckedChange = {
+                            scope.launch { viewModel.settingsRepository.updateYtStreamingOptions(autoQueueRelated = it) }
+                        },
+                    )
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+                    ToggleRow(
+                        icon = Icons.Rounded.SkipNext,
+                        iconTint = colors.teal,
+                        title = "Skip silence",
+                        subtitle = "Automatically skip quiet gaps during audio playback",
+                        checked = settings.ytSkipSilence,
+                        enabled = enabled,
+                        onCheckedChange = {
+                            scope.launch { viewModel.settingsRepository.updateYtStreamingOptions(skipSilence = it) }
+                        },
+                    )
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+                    ToggleRow(
+                        icon = Icons.Rounded.Image,
+                        iconTint = colors.amber,
+                        title = "Show album artwork",
+                        subtitle = "Display remote album covers in Discover lists, mini-player and Now Playing",
+                        checked = settings.ytShowArtwork,
+                        enabled = enabled,
+                        onCheckedChange = {
+                            scope.launch { viewModel.settingsRepository.updateYtStreamingOptions(showArtwork = it) }
+                        },
+                    )
+                }
+            }
+        }
+
+        item {
+            SettingsSectionCard(title = "Resolver & Content Region") {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(Icons.Rounded.Tune, contentDescription = null, tint = colors.teal, modifier = Modifier.size(18.dp))
+                        Text("Audio extractor engine", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                    }
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        listOf(
+                            "AUTO" to "Auto (NewPipe + Fallback)",
+                            "NEWPIPE" to "NewPipe Extractor",
+                            "ANDROID_VR" to "Android VR",
+                            "IOS" to "iOS Client",
+                        ).forEach { (id, label) ->
+                            FilterChip(
+                                selected = settings.ytResolverProfile.equals(id, ignoreCase = true),
+                                enabled = enabled,
+                                onClick = {
+                                    scope.launch { viewModel.settingsRepository.updateYtStreamingOptions(resolverProfile = id) }
+                                },
+                                label = { Text(label) },
+                            )
+                        }
+                    }
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(Icons.Rounded.Public, contentDescription = null, tint = colors.sky, modifier = Modifier.size(18.dp))
+                        Text("Charts & search region", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                    }
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        listOf("US", "IN", "GB", "JP", "KR", "DE", "BR", "CA").forEach { code ->
+                            FilterChip(
+                                selected = settings.ytCountryCode.equals(code, ignoreCase = true),
+                                enabled = enabled,
+                                onClick = {
+                                    scope.launch { viewModel.settingsRepository.updateYtStreamingOptions(countryCode = code) }
+                                },
+                                label = { Text(code) },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        item {
+            OutlinedButton(
+                onClick = {
+                    scope.launch { viewModel.settingsRepository.resetYtStreamingOptions() }
+                    onMessage("Discover settings reset to defaults")
+                },
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("yt_streaming_reset_btn"),
+            ) {
+                Icon(Icons.Rounded.RestartAlt, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Reset to defaults")
+            }
+        }
+    }
+}
+
 @Composable
 internal fun ConnectionDiagnosticsSettingsContent(
     activeHostLabel: String?,
@@ -1013,6 +1235,8 @@ internal fun ToggleRow(
     icon: ImageVector? = null,
     iconTint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     checked: Boolean,
+    enabled: Boolean = true,
+    switchTestTag: String? = null,
     onCheckedChange: (Boolean) -> Unit,
 ) {
     Row(
@@ -1037,7 +1261,12 @@ internal fun ToggleRow(
                 Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        Switch(
+            checked = checked,
+            enabled = enabled,
+            onCheckedChange = onCheckedChange,
+            modifier = if (switchTestTag != null) Modifier.testTag(switchTestTag) else Modifier,
+        )
     }
 }
 

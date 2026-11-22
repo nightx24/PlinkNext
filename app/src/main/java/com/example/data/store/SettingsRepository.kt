@@ -13,6 +13,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.example.data.model.AppSettingsState
 import com.example.data.model.AppThemeMode
 import com.example.data.model.HomeActivityItem
+import com.example.data.model.YtAudioQuality
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import org.json.JSONArray
@@ -84,6 +85,15 @@ class SettingsRepository(context: Context) {
             videoPinchZoomEnabled = prefs[KEY_VIDEO_PINCH] ?: true,
             videoTapToTogglePlayback = prefs[KEY_VIDEO_TAP_TOGGLE] ?: false,
             videoAutoFullscreen = prefs[KEY_VIDEO_AUTO_FS] ?: false,
+            ytStreamingEnabled = prefs[KEY_YT_STREAMING_ENABLED] ?: true,
+            ytAudioQuality = YtAudioQuality.fromPref(prefs[KEY_YT_AUDIO_QUALITY]),
+            ytResolverProfile = prefs[KEY_YT_RESOLVER_PROFILE] ?: "AUTO",
+            ytCountryCode = prefs[KEY_YT_COUNTRY_CODE] ?: "US",
+            ytLyricsEnabled = prefs[KEY_YT_LYRICS_ENABLED] ?: true,
+            ytAutoQueueRelated = prefs[KEY_YT_AUTO_QUEUE] ?: true,
+            ytShowArtwork = prefs[KEY_YT_SHOW_ARTWORK] ?: true,
+            ytSkipSilence = prefs[KEY_YT_SKIP_SILENCE] ?: false,
+            ytLocalLosslessEnabled = prefs[KEY_YT_LOCAL_LOSSLESS] ?: false,
             floatingShortcutEnabled = prefs[KEY_FLOATING_SHORTCUT] ?: false,
             floatingShortcutTapAction = prefs[KEY_FLOATING_TAP_ACTION] ?: "menu",
             floatingShortcutLongPressEnabled = prefs[KEY_FLOATING_LONG_PRESS] ?: true,
@@ -220,6 +230,44 @@ class SettingsRepository(context: Context) {
         }
     }
 
+    suspend fun updateYtStreamingOptions(
+        enabled: Boolean? = null,
+        audioQuality: YtAudioQuality? = null,
+        resolverProfile: String? = null,
+        countryCode: String? = null,
+        lyricsEnabled: Boolean? = null,
+        autoQueueRelated: Boolean? = null,
+        showArtwork: Boolean? = null,
+        skipSilence: Boolean? = null,
+        localLosslessEnabled: Boolean? = null,
+    ) {
+        dataStore.edit { prefs ->
+            enabled?.let { prefs[KEY_YT_STREAMING_ENABLED] = it }
+            audioQuality?.let { prefs[KEY_YT_AUDIO_QUALITY] = it.prefKey }
+            resolverProfile?.let { prefs[KEY_YT_RESOLVER_PROFILE] = it }
+            countryCode?.let { prefs[KEY_YT_COUNTRY_CODE] = it.uppercase() }
+            lyricsEnabled?.let { prefs[KEY_YT_LYRICS_ENABLED] = it }
+            autoQueueRelated?.let { prefs[KEY_YT_AUTO_QUEUE] = it }
+            showArtwork?.let { prefs[KEY_YT_SHOW_ARTWORK] = it }
+            skipSilence?.let { prefs[KEY_YT_SKIP_SILENCE] = it }
+            localLosslessEnabled?.let { prefs[KEY_YT_LOCAL_LOSSLESS] = it }
+        }
+    }
+
+    suspend fun resetYtStreamingOptions() {
+        dataStore.edit { prefs ->
+            prefs.remove(KEY_YT_STREAMING_ENABLED)
+            prefs.remove(KEY_YT_AUDIO_QUALITY)
+            prefs.remove(KEY_YT_RESOLVER_PROFILE)
+            prefs.remove(KEY_YT_COUNTRY_CODE)
+            prefs.remove(KEY_YT_LYRICS_ENABLED)
+            prefs.remove(KEY_YT_AUTO_QUEUE)
+            prefs.remove(KEY_YT_SHOW_ARTWORK)
+            prefs.remove(KEY_YT_SKIP_SILENCE)
+            prefs.remove(KEY_YT_LOCAL_LOSSLESS)
+        }
+    }
+
     suspend fun setFloatingShortcutConfig(
         enabled: Boolean? = null,
         shortcuts: List<String>? = null,
@@ -333,6 +381,15 @@ class SettingsRepository(context: Context) {
         private val KEY_VIDEO_PINCH = booleanPreferencesKey("video_pinch")
         private val KEY_VIDEO_TAP_TOGGLE = booleanPreferencesKey("video_tap_toggle")
         private val KEY_VIDEO_AUTO_FS = booleanPreferencesKey("video_auto_fs")
+        private val KEY_YT_STREAMING_ENABLED = booleanPreferencesKey("yt_streaming_enabled")
+        private val KEY_YT_AUDIO_QUALITY = stringPreferencesKey("yt_audio_quality")
+        private val KEY_YT_RESOLVER_PROFILE = stringPreferencesKey("yt_resolver_profile")
+        private val KEY_YT_COUNTRY_CODE = stringPreferencesKey("yt_country_code")
+        private val KEY_YT_LYRICS_ENABLED = booleanPreferencesKey("yt_lyrics_enabled")
+        private val KEY_YT_AUTO_QUEUE = booleanPreferencesKey("yt_auto_queue_related")
+        private val KEY_YT_SHOW_ARTWORK = booleanPreferencesKey("yt_show_artwork")
+        private val KEY_YT_SKIP_SILENCE = booleanPreferencesKey("yt_skip_silence")
+        private val KEY_YT_LOCAL_LOSSLESS = booleanPreferencesKey("yt_local_lossless_enabled")
         private val KEY_FLOATING_SHORTCUT = booleanPreferencesKey("floating_shortcut")
         private val KEY_FLOATING_TAP_ACTION = stringPreferencesKey("floating_tap_action")
         private val KEY_FLOATING_LONG_PRESS = booleanPreferencesKey("floating_long_press")

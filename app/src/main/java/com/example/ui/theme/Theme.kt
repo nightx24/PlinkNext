@@ -27,6 +27,7 @@ data class PocketLinkSemanticColors(
     val violet: Color,
     val sky: Color,
     val emerald: Color,
+    val cloudflare: Color,
     val cardBorder: Color,
 )
 
@@ -40,6 +41,7 @@ val LocalPocketLinkColors = staticCompositionLocalOf {
         violet = VioletAccent,
         sky = SkyAccent,
         emerald = EmeraldSuccess,
+        cloudflare = CloudflareOrange,
         cardBorder = Color.White.copy(alpha = 0.07f),
     )
 }
@@ -145,6 +147,7 @@ fun PocketLinkTheme(
             violet = VioletAccent,
             sky = SkyAccent,
             emerald = EmeraldSuccess,
+            cloudflare = CloudflareOrange,
             cardBorder = Color.White.copy(alpha = 0.075f),
         )
     } else {
@@ -156,6 +159,7 @@ fun PocketLinkTheme(
             violet = VioletLightAccent,
             sky = SkyLightAccent,
             emerald = EmeraldLightSuccess,
+            cloudflare = CloudflareLightOrange,
             cardBorder = Color(0xFF192348).copy(alpha = 0.09f),
         )
     }

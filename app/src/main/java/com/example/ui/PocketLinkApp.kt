@@ -1,6 +1,7 @@
 package com.example.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
@@ -56,8 +57,10 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -90,9 +93,12 @@ import com.example.data.model.MediaExtensions
 import com.example.data.model.StorageVolume
 import com.example.ui.components.FloatingDockScrimBackdrop
 import com.example.ui.components.FloatingNavigationDock
+import com.example.ui.components.LocalBackdropGlassState
 import com.example.ui.components.MusicQuickAccessMenu
 import com.example.ui.components.PersistentMiniPlayer
+import com.example.ui.components.backdropGlassSource
 import com.example.ui.components.liquidBackdropBlur
+import com.example.ui.components.rememberBackdropGlassState
 import com.example.ui.screens.AboutScreen
 import com.example.ui.screens.ConnectionScreen
 import com.example.ui.screens.DiagnosticsScreen
@@ -110,7 +116,9 @@ import com.example.ui.screens.SearchScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.screens.TransferManagerScreen
 import com.example.ui.screens.VideoPlayerScreen
+import com.example.ui.screens.YtMusicScreen
 import com.example.ui.theme.PocketLinkTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 enum class MainTab(val id: String, val label: String, val icon: ImageVector) {
@@ -121,12 +129,13 @@ enum class MainTab(val id: String, val label: String, val icon: ImageVector) {
 
 sealed interface OverlayRoute {
     data object HostSetup : OverlayRoute
-    data object Settings : OverlayRoute
+    data class Settings(val openYtStreaming: Boolean = false) : OverlayRoute
     data object Transfers : OverlayRoute
     data object Diagnostics : OverlayRoute
     data object About : OverlayRoute
     data object Search : OverlayRoute
     data object Documents : OverlayRoute
+    data object YtMusic : OverlayRoute
     data class Photos(val favoritesOnly: Boolean = false) : OverlayRoute
     data class PhotoViewer(val photos: List<IndexedFile>, val index: Int) : OverlayRoute
     data class MediaLibrary(val category: MediaCategory) : OverlayRoute
@@ -139,9 +148,13 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val connection by viewModel.connection.collectAsStateWithLifecycle()
     val hostStatus by viewModel.hostStatus.collectAsStateWithLifecycle()
+    val tunnelStatus by viewModel.tunnelStatus.collectAsStateWithLifecycle()
+    val tunnelConfig by viewModel.tunnelConfig.collectAsStateWithLifecycle()
     val audioState by viewModel.audioController.state.collectAsStateWithLifecycle()
     val transfers by viewModel.transferManager.transfers.collectAsStateWithLifecycle()
     val imageLoader by viewModel.imageLoader.collectAsStateWithLifecycle()
+    val ytMusicState by viewModel.ytMusic.collectAsStateWithLifecycle()
+    val lyrics by viewModel.lyricsState.collectAsStateWithLifecycle()
 
     val overlayStack = remember { mutableStateListOf<OverlayRoute>() }
     var selectedTab by remember { mutableStateOf(MainTab.HOME) }
@@ -175,6 +188,13 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                 overlayStack.clear()
                 selectedTab = MainTab.EXPLORE
             }
+            "yt_music" -> {
+                if (settings.ytStreamingEnabled) {
+                    overlayStack.add(OverlayRoute.YtMusic)
+                } else {
+                    overlayStack.add(OverlayRoute.Settings(openYtStreaming = true))
+                }
+            }
             "files" -> {
                 overlayStack.clear()
                 filesInitialVolume = null
@@ -203,7 +223,7 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                     mime = "",
                 )
                 miniPlayerDismissed = false
-                viewModel.audioController.playQueue(listOf(track), 0)
+                viewModel.playHostOrLocalPlaylist(listOf(track), 0)
                 overlayStack.add(OverlayRoute.NowPlaying)
             }
             "folder" -> {
@@ -305,19 +325,62 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                     },
             ) { isConnected ->
                 if (!isConnected || activeApi == null) {
-                    ConnectionScreen(
-                        connectionState = connection,
-                        hostStatus = hostStatus,
-                        onConnect = { name, host, port, user, pass, id ->
-                            viewModel.connect(name, host, port, user, pass, id)
-                        },
-                        onQuickStartLocal = { viewModel.quickStartLocalDevice() },
-                        onDeleteProfile = { viewModel.deleteProfile(it) },
-                        onOpenHostSetup = { overlayStack.add(OverlayRoute.HostSetup) },
-                        onOpenDiagnostics = { overlayStack.add(OverlayRoute.Diagnostics) },
-                        onOpenAbout = { overlayStack.add(OverlayRoute.About) },
-                        onRefreshHostStatus = { viewModel.refreshHostStatus() },
-                    )
+                    val disconnectBackdrop = rememberBackdropGlassState(settings.useLiquidGlass)
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .backdropGlassSource(disconnectBackdrop),
+                        ) {
+                            ConnectionScreen(
+                                connectionState = connection,
+                                hostStatus = hostStatus,
+                                tunnelStatus = tunnelStatus,
+                                tunnelConfig = tunnelConfig,
+                                ytStreamingEnabled = settings.ytStreamingEnabled,
+                                onConnect = { name, host, port, user, pass, id ->
+                                    viewModel.connect(name, host, port, user, pass, id)
+                                },
+                                onQuickStartLocal = { viewModel.quickStartLocalDevice() },
+                                onToggleCloudflareTunnel = { turnOn ->
+                                    if (turnOn) {
+                                        viewModel.startCloudflareTunnel()
+                                            .onFailure { overlayStack.add(OverlayRoute.HostSetup) }
+                                    } else {
+                                        viewModel.stopCloudflareTunnel()
+                                    }
+                                },
+                                onDeleteProfile = { viewModel.deleteProfile(it) },
+                                onOpenHostSetup = { overlayStack.add(OverlayRoute.HostSetup) },
+                                onOpenYtMusic = { overlayStack.add(OverlayRoute.YtMusic) },
+                                onOpenYtSettings = { overlayStack.add(OverlayRoute.Settings(openYtStreaming = true)) },
+                                onOpenSettings = { overlayStack.add(OverlayRoute.Settings()) },
+                                onOpenDiagnostics = { overlayStack.add(OverlayRoute.Diagnostics) },
+                                onOpenAbout = { overlayStack.add(OverlayRoute.About) },
+                                onRefreshHostStatus = { viewModel.refreshHostStatus() },
+                                onClearError = { viewModel.clearConnectionError() },
+                            )
+                        }
+                        CompositionLocalProvider(LocalBackdropGlassState provides disconnectBackdrop) {
+                            PersistentMiniPlayer(
+                                state = audioState,
+                                visible = settings.showMiniPlayer && (!miniPlayerDismissed || audioState.isPlaying),
+                                useLiquidGlass = settings.useLiquidGlass,
+                                imageLoader = imageLoader,
+                                showArtwork = settings.ytShowArtwork,
+                                onOpenNowPlaying = { overlayStack.add(OverlayRoute.NowPlaying) },
+                                onTogglePlayPause = { viewModel.audioController.togglePlayPause() },
+                                onPrevious = { viewModel.audioController.previous() },
+                                onNext = { viewModel.audioController.next() },
+                                onDismiss = { miniPlayerDismissed = true },
+                                onMiniPlayerBounds = { miniPlayerBounds = it },
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .navigationBarsPadding()
+                                    .padding(bottom = 10.dp),
+                            )
+                        }
+                    }
                 } else {
                     MainConnectedShell(
                         viewModel = viewModel,
@@ -326,6 +389,7 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                         settings = settings,
                         audioState = audioState,
                         transfers = transfers,
+                        imageLoader = imageLoader,
                         snackbarHostState = snackbarHostState,
                         selectedTab = selectedTab,
                         onSelectTab = { selectedTab = it },
@@ -353,12 +417,33 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                 }
             }
 
-            BackHandler(enabled = nowPlayingMounted || topNonPlayerOverlay != null) {
-                when {
-                    nowPlayingMounted && !nowPlayingClosing -> dismissNowPlaying()
-                    topNonPlayerOverlay != null -> {
+            var overlayBackProgress by remember { mutableFloatStateOf(0f) }
+
+            PredictiveBackHandler(enabled = nowPlayingMounted || topNonPlayerOverlay != null) { progressFlow ->
+                if (nowPlayingMounted && !nowPlayingClosing) {
+                    try {
+                        progressFlow.collect { backEvent ->
+                            nowPlayingProgress.snapTo((1f - backEvent.progress * 0.42f).coerceIn(0.45f, 1f))
+                        }
+                        dismissNowPlaying()
+                    } catch (e: CancellationException) {
+                        nowPlayingProgress.animateTo(
+                            targetValue = 1f,
+                            animationSpec = spring(dampingRatio = 0.88f, stiffness = 410f),
+                        )
+                        throw e
+                    }
+                } else if (topNonPlayerOverlay != null) {
+                    try {
+                        progressFlow.collect { backEvent ->
+                            overlayBackProgress = backEvent.progress.coerceIn(0f, 1f)
+                        }
+                        overlayBackProgress = 0f
                         val idx = overlayStack.indexOfLast { it != OverlayRoute.NowPlaying }
                         if (idx >= 0) overlayStack.removeAt(idx)
+                    } catch (e: CancellationException) {
+                        overlayBackProgress = 0f
+                        throw e
                     }
                 }
             }
@@ -383,11 +468,13 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                 modifier = Modifier
                     .fillMaxSize()
                     .graphicsLayer {
-                        if (depthProgress > 0f) {
-                            val s = lerp(1f, 0.935f, depthProgress)
+                        val combinedDepth = depthProgress.coerceAtLeast(overlayBackProgress * 0.6f)
+                        if (combinedDepth > 0f) {
+                            val s = lerp(1f, 0.92f, combinedDepth)
                             scaleX = s
                             scaleY = s
-                            shape = RoundedCornerShape((24f * depthProgress).dp)
+                            translationY = overlayBackProgress * 32f
+                            shape = RoundedCornerShape((24f * combinedDepth).dp)
                             clip = true
                         }
                     },
@@ -414,12 +501,13 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                                     }
                                 },
                             )
-                            OverlayRoute.Settings -> SettingsScreen(
+                            is OverlayRoute.Settings -> SettingsScreen(
                                 viewModel = viewModel,
                                 settings = settings,
                                 activeHostLabel = connection.activeProfile?.displayName
                                     ?: activeApi?.baseUrl?.removePrefix("http://")?.removePrefix("https://"),
                                 routeType = activeApi?.routeType,
+                                initialOpenYtStreaming = route.openYtStreaming,
                                 onOpenHostSetup = { overlayStack.add(OverlayRoute.HostSetup) },
                                 onOpenDiagnostics = { overlayStack.add(OverlayRoute.Diagnostics) },
                                 onOpenAbout = { overlayStack.add(OverlayRoute.About) },
@@ -430,13 +518,63 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                                 },
                                 onBack = { overlayStack.removeAt(overlayStack.lastIndex) },
                             )
+                            OverlayRoute.YtMusic -> YtMusicScreen(
+                                ytState = ytMusicState,
+                                settings = settings,
+                                playbackState = audioState,
+                                imageLoader = imageLoader,
+                                onLoadHome = { viewModel.loadYtHomeFeed(it) },
+                                onQueryChange = { viewModel.updateYtSearchQuery(it) },
+                                onSubmitSearch = { viewModel.searchYtMusic(it) },
+                                onPlayTrack = { track, list ->
+                                    miniPlayerDismissed = false
+                                    viewModel.playYtTrack(track, list)
+                                },
+                                onQueueTrack = { track ->
+                                    val active = audioState.currentTrack
+                                    if (active == null) {
+                                        miniPlayerDismissed = false
+                                        viewModel.playYtTrack(track, listOf(track))
+                                    } else {
+                                        val resolved = viewModel.resolveDiscoverTrack(track)
+                                        viewModel.audioController.appendRelatedTracks(active.path, listOf(resolved))
+                                        val suffix = if (resolved.isLocalLosslessMatch) " (Local Lossless)" else ""
+                                        scope.launch { snackbarHostState.showSnackbar("Added \"${track.title}\"$suffix to queue") }
+                                    }
+                                },
+                                onEnableStreaming = {
+                                    scope.launch {
+                                        viewModel.settingsRepository.updateYtStreamingOptions(enabled = true)
+                                    }
+                                },
+                                onToggleLocalLossless = { enabled ->
+                                    viewModel.setDiscoverLocalLosslessEnabled(enabled)
+                                },
+                                onRefreshLocalLossless = {
+                                    viewModel.refreshLocalLosslessLibrary(force = true)
+                                },
+                                onSelectQuality = { tier ->
+                                    viewModel.setYtAudioQuality(tier)
+                                },
+                                onToggleAutoplay = { enabled ->
+                                    viewModel.setAutoplayEnabled(enabled)
+                                },
+                                onLoadMore = {
+                                    viewModel.loadMoreDiscoverTracks()
+                                },
+                                onOpenDiagnostics = { overlayStack.add(OverlayRoute.Diagnostics) },
+                                onOpenYtSettings = { overlayStack.add(OverlayRoute.Settings(openYtStreaming = true)) },
+                                onOpenNowPlaying = { overlayStack.add(OverlayRoute.NowPlaying) },
+                                onBack = { overlayStack.removeAt(overlayStack.lastIndex) },
+                            )
                             OverlayRoute.Transfers -> TransferManagerScreen(
                                 transfers = transfers,
                                 transferManager = viewModel.transferManager,
                                 onBack = { overlayStack.removeAt(overlayStack.lastIndex) },
                             )
                             OverlayRoute.Diagnostics -> DiagnosticsScreen(
-                                onBack = { overlayStack.removeAt(overlayStack.lastIndex) }
+                                viewModel = viewModel,
+                                onBack = { overlayStack.removeAt(overlayStack.lastIndex) },
                             )
                             OverlayRoute.About -> AboutScreen(
                                 onBack = { overlayStack.removeAt(overlayStack.lastIndex) }
@@ -457,7 +595,7 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                                             MediaExtensions.isAudio(item.name) -> {
                                                 viewModel.recordActivity("track", item.name, item.path, vol)
                                                 miniPlayerDismissed = false
-                                                viewModel.audioController.playQueue(listOf(item), 0)
+                                                viewModel.playHostOrLocalPlaylist(listOf(item), 0)
                                                 overlayStack.add(OverlayRoute.NowPlaying)
                                             }
                                             MediaExtensions.isVideo(item.name) -> {
@@ -515,13 +653,15 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                                     api = activeApi,
                                     imageLoader = imageLoader,
                                     category = route.category,
+                                    showYtMusic = settings.ytStreamingEnabled,
+                                    onOpenYtMusic = { overlayStack.add(OverlayRoute.YtMusic) },
                                     onPlayAudio = { tracks, idx ->
                                         val track = tracks.getOrNull(idx)
                                         if (track != null) {
                                             viewModel.recordActivity("track", track.name, track.path, track.volume.takeIf { it != "internal" })
                                         }
                                         miniPlayerDismissed = false
-                                        viewModel.audioController.playQueue(tracks, idx)
+                                        viewModel.playHostOrLocalPlaylist(tracks, idx)
                                         overlayStack.add(OverlayRoute.NowPlaying)
                                     },
                                     onPlayVideo = { video ->
@@ -624,6 +764,15 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                                 showStatsForNerds = settings.showStatsForNerds,
                                 enableGestures = settings.enableNowPlayingGestures,
                                 shortcuts = settings.floatingShortcuts,
+                                imageLoader = imageLoader,
+                                showArtwork = settings.ytShowArtwork,
+                                lyricsEnabled = settings.ytLyricsEnabled,
+                                lyrics = lyrics,
+                                ytAudioQuality = settings.ytAudioQuality,
+                                autoplayEnabled = settings.ytAutoQueueRelated,
+                                onToggleAutoplay = { enabled -> viewModel.setAutoplayEnabled(enabled) },
+                                onLoadMoreSuggestions = { viewModel.requestMoreAutoplaySuggestions() },
+                                onChangeYtAudioQuality = { tier -> viewModel.setYtAudioQuality(tier) },
                                 onSelectShortcut = { shortcutId ->
                                     dismissNowPlaying { openShortcut(shortcutId) }
                                 },
@@ -645,6 +794,7 @@ private fun MainConnectedShell(
     settings: com.example.data.model.AppSettingsState,
     audioState: com.example.media.AudioPlaybackState,
     transfers: List<com.example.data.model.TransferItem>,
+    imageLoader: coil.ImageLoader,
     snackbarHostState: SnackbarHostState,
     selectedTab: MainTab,
     onSelectTab: (MainTab) -> Unit,
@@ -709,11 +859,15 @@ private fun MainConnectedShell(
                 },
                 onOpenPhotos = { fav -> onOpenOverlay(OverlayRoute.Photos(fav)) },
                 onOpenMusic = { onOpenOverlay(OverlayRoute.MediaLibrary(MediaCategory.MUSIC)) },
+                onOpenYtMusic = {
+                    if (settings.ytStreamingEnabled) onOpenOverlay(OverlayRoute.YtMusic)
+                    else onOpenOverlay(OverlayRoute.Settings(openYtStreaming = true))
+                },
                 onOpenVideos = { onOpenOverlay(OverlayRoute.MediaLibrary(MediaCategory.VIDEO)) },
                 onOpenDocuments = { onOpenOverlay(OverlayRoute.Documents) },
                 onOpenSearch = { onOpenOverlay(OverlayRoute.Search) },
                 onOpenTransfers = { onOpenOverlay(OverlayRoute.Transfers) },
-                onOpenSettings = { onOpenOverlay(OverlayRoute.Settings) },
+                onOpenSettings = { onOpenOverlay(OverlayRoute.Settings()) },
                 onQuickThemeChange = onQuickThemeChange,
             )
         },
@@ -769,11 +923,15 @@ private fun MainConnectedShell(
                         },
                         onOpenPhotos = { fav -> onOpenOverlay(OverlayRoute.Photos(fav)) },
                         onOpenMusic = { onOpenOverlay(OverlayRoute.MediaLibrary(MediaCategory.MUSIC)) },
+                        onOpenYtMusic = {
+                            if (settings.ytStreamingEnabled) onOpenOverlay(OverlayRoute.YtMusic)
+                            else onOpenOverlay(OverlayRoute.Settings(openYtStreaming = true))
+                        },
                         onOpenVideos = { onOpenOverlay(OverlayRoute.MediaLibrary(MediaCategory.VIDEO)) },
                         onOpenDocuments = { onOpenOverlay(OverlayRoute.Documents) },
                         onOpenSearch = { onOpenOverlay(OverlayRoute.Search) },
                         onOpenTransfers = { onOpenOverlay(OverlayRoute.Transfers) },
-                        onOpenSettings = { onOpenOverlay(OverlayRoute.Settings) },
+                        onOpenSettings = { onOpenOverlay(OverlayRoute.Settings()) },
                         onUploadFiles = onUploadFiles,
                         onOpenRecentFile = { recent ->
                             val item = IndexedFile(
@@ -789,7 +947,7 @@ private fun MainConnectedShell(
                                 MediaExtensions.isAudio(recent.file.name) -> {
                                     viewModel.recordActivity("track", recent.file.name, recent.path, recent.volume)
                                     onSetMiniPlayerDismissed(false)
-                                    viewModel.audioController.playQueue(listOf(item), 0)
+                                    viewModel.playHostOrLocalPlaylist(listOf(item), 0)
                                     onOpenOverlay(OverlayRoute.NowPlaying)
                                 }
                                 MediaExtensions.isVideo(recent.file.name) -> {
@@ -822,6 +980,8 @@ private fun MainConnectedShell(
                     )
 
                     MainTab.EXPLORE -> ExploreScreen(
+                        showYtMusic = settings.ytStreamingEnabled,
+                        onOpenYtMusic = { onOpenOverlay(OverlayRoute.YtMusic) },
                         onOpenPhotos = { onOpenOverlay(OverlayRoute.Photos(false)) },
                         onOpenMusic = { onOpenOverlay(OverlayRoute.MediaLibrary(MediaCategory.MUSIC)) },
                         onOpenVideos = { onOpenOverlay(OverlayRoute.MediaLibrary(MediaCategory.VIDEO)) },
@@ -847,7 +1007,7 @@ private fun MainConnectedShell(
                                 viewModel.recordActivity("track", t.name, t.path, t.volume.takeIf { it != "internal" })
                             }
                             onSetMiniPlayerDismissed(false)
-                            viewModel.audioController.playQueue(tracks, idx)
+                            viewModel.playHostOrLocalPlaylist(tracks, idx)
                             onOpenOverlay(OverlayRoute.NowPlaying)
                         },
                         onOpenVideo = { video ->
@@ -896,36 +1056,42 @@ private fun MainConnectedShell(
                     )
                     NavigationRailItem(
                         selected = false,
-                        onClick = { onOpenOverlay(OverlayRoute.Settings) },
+                        onClick = { onOpenOverlay(OverlayRoute.Settings()) },
                         icon = { Icon(Icons.Rounded.Settings, contentDescription = "Settings") },
                         label = { Text("Settings") },
                     )
                 }
+                val railBackdrop = rememberBackdropGlassState(settings.useLiquidGlass)
                 Box(modifier = Modifier.weight(1f).fillMaxSize()) {
-                    tabContent(Modifier.fillMaxSize())
-                    Column(
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .fillMaxWidth()
-                            .navigationBarsPadding()
-                            .padding(bottom = 8.dp),
-                    ) {
-                        SnackbarHost(hostState = snackbarHostState)
-                        PersistentMiniPlayer(
-                            state = audioState,
-                            visible = settings.showMiniPlayer && (!miniPlayerDismissed || audioState.isPlaying),
-                            useLiquidGlass = settings.useLiquidGlass,
-                            onOpenNowPlaying = { onOpenOverlay(OverlayRoute.NowPlaying) },
-                            onTogglePlayPause = { viewModel.audioController.togglePlayPause() },
-                            onPrevious = { viewModel.audioController.previous() },
-                            onNext = { viewModel.audioController.next() },
-                            onDismiss = { onSetMiniPlayerDismissed(true) },
-                            onMiniPlayerBounds = onMiniPlayerBounds,
-                        )
+                    tabContent(Modifier.fillMaxSize().backdropGlassSource(railBackdrop))
+                    CompositionLocalProvider(LocalBackdropGlassState provides railBackdrop) {
+                        Column(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .fillMaxWidth()
+                                .navigationBarsPadding()
+                                .padding(bottom = 8.dp),
+                        ) {
+                            SnackbarHost(hostState = snackbarHostState)
+                            PersistentMiniPlayer(
+                                state = audioState,
+                                visible = settings.showMiniPlayer && (!miniPlayerDismissed || audioState.isPlaying),
+                                useLiquidGlass = settings.useLiquidGlass,
+                                imageLoader = imageLoader,
+                                showArtwork = settings.ytShowArtwork,
+                                onOpenNowPlaying = { onOpenOverlay(OverlayRoute.NowPlaying) },
+                                onTogglePlayPause = { viewModel.audioController.togglePlayPause() },
+                                onPrevious = { viewModel.audioController.previous() },
+                                onNext = { viewModel.audioController.next() },
+                                onDismiss = { onSetMiniPlayerDismissed(true) },
+                                onMiniPlayerBounds = onMiniPlayerBounds,
+                            )
+                        }
                     }
                 }
             }
         } else {
+            val dockBackdrop = rememberBackdropGlassState(settings.useLiquidGlass)
             val contentBlurRadius by animateDpAsState(
                 targetValue = if (dockQuickMenuExpanded) 18.dp else 0.dp,
                 animationSpec = tween(200),
@@ -935,12 +1101,13 @@ private fun MainConnectedShell(
                 tabContent(
                     Modifier
                         .fillMaxSize()
+                        .backdropGlassSource(dockBackdrop)
                         .liquidBackdropBlur(contentBlurRadius)
                 )
 
                 // Soft atmospheric backdrop behind the floating dock / mini player
-                // so scrolling text dissolves gently instead of colliding under glass controls
                 FloatingDockScrimBackdrop(
+                    useLiquidGlass = settings.useLiquidGlass,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .height(if (settings.showMiniPlayer && audioState.currentTrack != null && (!miniPlayerDismissed || audioState.isPlaying)) 180.dp else 112.dp),
@@ -965,97 +1132,101 @@ private fun MainConnectedShell(
                     )
                 }
 
-                AnimatedVisibility(
-                    visible = dockQuickMenuExpanded,
-                    enter = fadeIn(tween(200)) +
-                        slideInVertically(initialOffsetY = { it / 4 }, animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy)) +
-                        scaleIn(initialScale = 0.90f, transformOrigin = TransformOrigin(0.9f, 1f)),
-                    exit = fadeOut(tween(150)) +
-                        slideOutVertically(targetOffsetY = { it / 5 }) +
-                        scaleOut(targetScale = 0.92f, transformOrigin = TransformOrigin(0.9f, 1f)),
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .navigationBarsPadding()
-                        .padding(end = 14.dp, bottom = 92.dp),
-                ) {
-                    MusicQuickAccessMenu(
-                        shortcutIds = settings.floatingShortcuts,
-                        useLiquidGlass = settings.useLiquidGlass,
-                        onSelect = onOpenShortcut,
-                        onOpenNowPlaying = {
-                            onSetDockQuickMenuExpanded(false)
-                            onSetMiniPlayerDismissed(false)
-                            viewModel.openOrStartMusicFromDock(
-                                onOpenNowPlaying = { onOpenOverlay(OverlayRoute.NowPlaying) },
-                                onOpenMusicLibrary = { onOpenOverlay(OverlayRoute.MediaLibrary(MediaCategory.MUSIC)) },
-                            )
-                        },
-                    )
-                }
-
-                Column(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth(),
-                ) {
-                    SnackbarHost(hostState = snackbarHostState)
-                    PersistentMiniPlayer(
-                        state = audioState,
-                        visible = settings.showMiniPlayer && (!miniPlayerDismissed || audioState.isPlaying),
-                        useLiquidGlass = settings.useLiquidGlass,
-                        onOpenNowPlaying = { onOpenOverlay(OverlayRoute.NowPlaying) },
-                        onTogglePlayPause = { viewModel.audioController.togglePlayPause() },
-                        onPrevious = { viewModel.audioController.previous() },
-                        onNext = { viewModel.audioController.next() },
-                        onDismiss = { onSetMiniPlayerDismissed(true) },
-                        onMiniPlayerBounds = onMiniPlayerBounds,
-                    )
-                    if (settings.showMiniPlayer && audioState.currentTrack != null && (!miniPlayerDismissed || audioState.isPlaying)) {
-                        Spacer(Modifier.height(4.dp))
-                    }
-                    FloatingNavigationDock(
-                        order = settings.navigationOrder,
-                        visibleItems = settings.visibleNavigationItems,
-                        selectedTabId = selectedTab.id,
-                        useLiquidGlass = settings.useLiquidGlass,
-                        isPlaying = audioState.isPlaying,
-                        hasMedia = audioState.currentTrack != null,
-                        isVideo = false,
-                        expandedMenuOpen = dockQuickMenuExpanded,
-                        onSelectTab = { id ->
-                            onSetDockQuickMenuExpanded(false)
-                            onSelectTab(MainTab.entries.firstOrNull { it.id == id } ?: MainTab.HOME)
-                        },
-                        onBrowsePressed = {
-                            if (dockQuickMenuExpanded) {
+                CompositionLocalProvider(LocalBackdropGlassState provides dockBackdrop) {
+                    AnimatedVisibility(
+                        visible = dockQuickMenuExpanded,
+                        enter = fadeIn(tween(200)) +
+                            slideInVertically(initialOffsetY = { it / 4 }, animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy)) +
+                            scaleIn(initialScale = 0.90f, transformOrigin = TransformOrigin(0.9f, 1f)),
+                        exit = fadeOut(tween(150)) +
+                            slideOutVertically(targetOffsetY = { it / 5 }) +
+                            scaleOut(targetScale = 0.92f, transformOrigin = TransformOrigin(0.9f, 1f)),
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .navigationBarsPadding()
+                            .padding(end = 14.dp, bottom = 92.dp),
+                    ) {
+                        MusicQuickAccessMenu(
+                            shortcutIds = settings.floatingShortcuts,
+                            useLiquidGlass = settings.useLiquidGlass,
+                            onSelect = onOpenShortcut,
+                            onOpenNowPlaying = {
                                 onSetDockQuickMenuExpanded(false)
-                            } else {
                                 onSetMiniPlayerDismissed(false)
                                 viewModel.openOrStartMusicFromDock(
                                     onOpenNowPlaying = { onOpenOverlay(OverlayRoute.NowPlaying) },
                                     onOpenMusicLibrary = { onOpenOverlay(OverlayRoute.MediaLibrary(MediaCategory.MUSIC)) },
                                 )
-                            }
-                        },
-                        onBrowseLongPress = {
-                            if (settings.floatingShortcutLongPressEnabled) {
-                                onSetDockQuickMenuExpanded(!dockQuickMenuExpanded)
-                            }
-                        },
-                        onSwipeMusicPrevious = {
-                            onSetMiniPlayerDismissed(false)
-                            viewModel.skipTrackFromDock(next = false) { msg ->
-                                scope.launch { snackbarHostState.showSnackbar(msg) }
-                            }
-                        },
-                        onSwipeMusicNext = {
-                            onSetMiniPlayerDismissed(false)
-                            viewModel.skipTrackFromDock(next = true) { msg ->
-                                scope.launch { snackbarHostState.showSnackbar(msg) }
-                            }
-                        },
-                        onMusicButtonBounds = onMusicButtonBounds,
-                    )
+                            },
+                        )
+                    }
+
+                    Column(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth(),
+                    ) {
+                        SnackbarHost(hostState = snackbarHostState)
+                        PersistentMiniPlayer(
+                            state = audioState,
+                            visible = settings.showMiniPlayer && (!miniPlayerDismissed || audioState.isPlaying),
+                            useLiquidGlass = settings.useLiquidGlass,
+                            imageLoader = imageLoader,
+                            showArtwork = settings.ytShowArtwork,
+                            onOpenNowPlaying = { onOpenOverlay(OverlayRoute.NowPlaying) },
+                            onTogglePlayPause = { viewModel.audioController.togglePlayPause() },
+                            onPrevious = { viewModel.audioController.previous() },
+                            onNext = { viewModel.audioController.next() },
+                            onDismiss = { onSetMiniPlayerDismissed(true) },
+                            onMiniPlayerBounds = onMiniPlayerBounds,
+                        )
+                        if (settings.showMiniPlayer && audioState.currentTrack != null && (!miniPlayerDismissed || audioState.isPlaying)) {
+                            Spacer(Modifier.height(4.dp))
+                        }
+                        FloatingNavigationDock(
+                            order = settings.navigationOrder,
+                            visibleItems = settings.visibleNavigationItems,
+                            selectedTabId = selectedTab.id,
+                            useLiquidGlass = settings.useLiquidGlass,
+                            isPlaying = audioState.isPlaying,
+                            hasMedia = audioState.currentTrack != null,
+                            isVideo = false,
+                            expandedMenuOpen = dockQuickMenuExpanded,
+                            onSelectTab = { id ->
+                                onSetDockQuickMenuExpanded(false)
+                                onSelectTab(MainTab.entries.firstOrNull { it.id == id } ?: MainTab.HOME)
+                            },
+                            onBrowsePressed = {
+                                if (dockQuickMenuExpanded) {
+                                    onSetDockQuickMenuExpanded(false)
+                                } else {
+                                    onSetMiniPlayerDismissed(false)
+                                    viewModel.openOrStartMusicFromDock(
+                                        onOpenNowPlaying = { onOpenOverlay(OverlayRoute.NowPlaying) },
+                                        onOpenMusicLibrary = { onOpenOverlay(OverlayRoute.MediaLibrary(MediaCategory.MUSIC)) },
+                                    )
+                                }
+                            },
+                            onBrowseLongPress = {
+                                if (settings.floatingShortcutLongPressEnabled) {
+                                    onSetDockQuickMenuExpanded(!dockQuickMenuExpanded)
+                                }
+                            },
+                            onSwipeMusicPrevious = {
+                                onSetMiniPlayerDismissed(false)
+                                viewModel.skipTrackFromDock(next = false) { msg ->
+                                    scope.launch { snackbarHostState.showSnackbar(msg) }
+                                }
+                            },
+                            onSwipeMusicNext = {
+                                onSetMiniPlayerDismissed(false)
+                                viewModel.skipTrackFromDock(next = true) { msg ->
+                                    scope.launch { snackbarHostState.showSnackbar(msg) }
+                                }
+                            },
+                            onMusicButtonBounds = onMusicButtonBounds,
+                        )
+                    }
                 }
             }
         }

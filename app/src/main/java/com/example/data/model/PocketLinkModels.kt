@@ -13,6 +13,7 @@ enum class AppThemeMode(val label: String) {
 enum class NetworkRouteType(val label: String, val detail: String) {
     LOCALHOST("This Device", "Loopback connection"),
     TAILSCALE("Tailscale", "Private encrypted tunnel"),
+    CLOUDFLARE("Cloudflare", "Cloudflare HTTPS tunnel"),
     HTTPS("HTTPS", "Encrypted remote proxy"),
     PRIVATE_LAN("Private LAN", "Local network"),
     PUBLIC("Remote", "Direct host"),
@@ -113,8 +114,30 @@ data class IndexedFile(
     val modified: String,
     val mime: String,
     val category: String? = null,
+    val artist: String? = null,
+    val artworkUrl: String? = null,
+    val streamUri: String? = null,
+    val durationText: String? = null,
+    val localLosslessBadge: String? = null,
+    val title: String? = null,
+    val album: String? = null,
+    val durationMs: Long = 0L,
+    val sampleRateHz: Int = 0,
+    val bitDepth: Int = 0,
+    val hasEmbeddedLyrics: Boolean = false,
+    val sourceVolume: String? = null,
+    val sourceFilePath: String? = null,
+    val isAutoplayRecommendation: Boolean = false,
 ) {
     val isDirectory: Boolean get() = type == "directory"
+    val isLocalLosslessMatch: Boolean get() = volume == "local_lossless" || !localLosslessBadge.isNullOrBlank()
+    val isYouTubeStream: Boolean get() = !isLocalLosslessMatch && (volume == "youtube" || streamUri?.startsWith("pocketlink-yt://") == true)
+    val displayTitle: String
+        get() = when {
+            isYouTubeStream || isLocalLosslessMatch -> name
+            !title.isNullOrBlank() -> title
+            else -> name.substringBeforeLast('.').replace('_', ' ')
+        }
     fun toFileEntry(): FileEntry = FileEntry(name = name, type = type, size = size, modified = modified)
     val parentPath: String
         get() {
@@ -165,7 +188,8 @@ data class ServerProfile(
     val username: String,
     val password: String = "",
 ) {
-    val address: String get() = "$host:$port"
+    val address: String
+        get() = if (host.startsWith("https://", ignoreCase = true) && port == 443) host else "$host:$port"
     val displayName: String get() = name.ifBlank { address }
 }
 
@@ -209,6 +233,24 @@ data class AppLogEntry(
     val details: String? = null,
 )
 
+enum class YtAudioQuality(val prefKey: String, val label: String, val shortLabel: String, val detail: String) {
+    AUTO("auto", "Auto (Network-Aware)", "Auto", "Best Opus on Wi-Fi (160–256 kbps), balanced ~128 kbps on mobile data"),
+    HIGH("high", "High (Best Opus)", "High", "Prioritizes highest-bitrate Opus (itag 774 / 251) up to 256 kbps"),
+    MEDIUM("medium", "Medium (~128 kbps)", "Medium", "Balanced Opus / M4A around 128 kbps for smooth streaming"),
+    LOW("low", "Low (~50–64 kbps)", "Low", "Lowest-bitrate Opus (itag 249) to minimize cellular data"),
+    ;
+
+    companion object {
+        fun fromPref(raw: String?): YtAudioQuality = when (raw?.trim()?.lowercase(Locale.US)) {
+            "auto" -> AUTO
+            "high" -> HIGH
+            "medium", "balanced" -> MEDIUM
+            "low", "data_saver" -> LOW
+            else -> AUTO
+        }
+    }
+}
+
 data class AppSettingsState(
     val themeMode: AppThemeMode = AppThemeMode.DARK,
     val amoled: Boolean = false,
@@ -233,6 +275,15 @@ data class AppSettingsState(
     val videoPinchZoomEnabled: Boolean = true,
     val videoTapToTogglePlayback: Boolean = false,
     val videoAutoFullscreen: Boolean = false,
+    val ytStreamingEnabled: Boolean = true,
+    val ytAudioQuality: YtAudioQuality = YtAudioQuality.AUTO,
+    val ytResolverProfile: String = "AUTO",
+    val ytCountryCode: String = "US",
+    val ytLyricsEnabled: Boolean = true,
+    val ytAutoQueueRelated: Boolean = true,
+    val ytShowArtwork: Boolean = true,
+    val ytSkipSilence: Boolean = false,
+    val ytLocalLosslessEnabled: Boolean = false,
     val floatingShortcutEnabled: Boolean = false,
     val floatingShortcutTapAction: String = "menu",
     val floatingShortcutLongPressEnabled: Boolean = true,
@@ -241,19 +292,19 @@ data class AppSettingsState(
     val homeActivity: List<HomeActivityItem> = emptyList(),
 ) {
     companion object {
-        val DEFAULT_QUICK_ACTIONS = listOf("upload", "drives", "favorites", "transfers")
+        val DEFAULT_QUICK_ACTIONS = listOf("upload", "yt_music", "favorites", "transfers")
         val ALL_QUICK_ACTIONS = listOf(
-            "files", "upload", "favorites", "photos", "music", "videos", "drives", "documents", "transfers"
+            "files", "yt_music", "upload", "favorites", "photos", "music", "videos", "drives", "documents", "transfers"
         )
         val DEFAULT_HOME_SECTION_ORDER = listOf(
             "search", "quick", "transfers", "continue", "recent"
         )
         val DEFAULT_NAVIGATION_ORDER = listOf("home", "explore", "files", "browse")
         val DEFAULT_FLOATING_SHORTCUTS = listOf(
-            "explore", "music", "files", "videos", "photos", "documents"
+            "explore", "yt_music", "music", "files", "videos", "photos", "documents"
         )
         val ALL_FLOATING_SHORTCUTS = listOf(
-            "explore", "files", "music", "videos", "photos", "documents", "favorites", "upload"
+            "explore", "yt_music", "files", "music", "videos", "photos", "documents", "favorites", "upload"
         )
     }
 }
@@ -314,10 +365,20 @@ fun parseServerEndpoint(rawHost: String, rawPortText: String): ParsedServerEndpo
         .trimEnd('/')
     val explicitPort = rawPortText.trim().toIntOrNull()?.takeIf { it in 1..65535 }
 
-    require(cleaned.isNotEmpty()) { "Enter the server Tailscale IP or address." }
+    require(cleaned.isNotEmpty()) { "Enter a Tailscale IP, Cloudflare HTTPS URL, or 127.0.0.1." }
 
-    if (cleaned.startsWith("http://", ignoreCase = true) || cleaned.startsWith("https://", ignoreCase = true)) {
-        val uri = runCatching { URI(cleaned) }.getOrNull()
+    val normalizedInput = if (
+        !cleaned.startsWith("http://", ignoreCase = true) &&
+        !cleaned.startsWith("https://", ignoreCase = true) &&
+        isCloudflareTunnelHost(cleaned.substringBefore('/').substringBefore(':'))
+    ) {
+        "https://$cleaned"
+    } else {
+        cleaned
+    }
+
+    if (normalizedInput.startsWith("http://", ignoreCase = true) || normalizedInput.startsWith("https://", ignoreCase = true)) {
+        val uri = runCatching { URI(normalizedInput) }.getOrNull()
         val scheme = uri?.scheme?.lowercase(Locale.US)
         val uriHost = uri?.host?.removePrefix("[")?.removeSuffix("]")
         if (!scheme.isNullOrBlank() && !uriHost.isNullOrBlank()) {
@@ -382,7 +443,7 @@ fun classifyNetworkRoute(baseUrl: String): NetworkRouteType {
         return NetworkRouteType.LOCALHOST
     }
     if (scheme == "https") {
-        return NetworkRouteType.HTTPS
+        return if (isCloudflareTunnelHost(host)) NetworkRouteType.CLOUDFLARE else NetworkRouteType.HTTPS
     }
     if (host.endsWith(".ts.net") || isTailscaleIpv4Host(host) || host.startsWith("fd7a:115c:a1e0")) {
         return NetworkRouteType.TAILSCALE
@@ -391,6 +452,14 @@ fun classifyNetworkRoute(baseUrl: String): NetworkRouteType {
         return NetworkRouteType.PRIVATE_LAN
     }
     return NetworkRouteType.PUBLIC
+}
+
+fun isCloudflareTunnelHost(rawHost: String): Boolean {
+    val host = rawHost.trim().lowercase(Locale.US)
+    return host.endsWith(".trycloudflare.com") ||
+        host.endsWith(".workers.dev") ||
+        host.endsWith(".cfargotunnel.com") ||
+        host.endsWith(".pages.dev")
 }
 
 private fun isTailscaleIpv4Host(host: String): Boolean {

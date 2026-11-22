@@ -21,6 +21,7 @@ import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -36,6 +37,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -63,6 +65,7 @@ import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Pause
@@ -73,6 +76,7 @@ import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
 import androidx.compose.material.icons.rounded.SwapHoriz
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -82,19 +86,25 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import android.graphics.RenderEffect as AndroidRenderEffect
+import android.graphics.Shader
+import android.os.Build
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import android.os.Build
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.BlurredEdgeTreatment
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
@@ -105,12 +115,20 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asComposeRenderEffect
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.layer.GraphicsLayer
+import androidx.compose.ui.graphics.layer.drawLayer
+import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
@@ -118,9 +136,13 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import coil.ImageLoader
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.example.data.model.FileEntry
 import com.example.data.model.MediaExtensions
 import com.example.data.model.NetworkRouteType
@@ -221,9 +243,66 @@ fun Modifier.liquidBackdropBlur(radius: androidx.compose.ui.unit.Dp): Modifier =
     }
 
 /**
- * Shared frosted/solid glass surface matching LiquidGlassPill from the PocketLink repo.
- * Uses high-opacity frosted optical milk-glass in Light Mode and smoked frost in Dark Mode
- * so underlying scrolling text never clashes with dock or mini-player controls.
+ * Holds a hardware-accelerated Compose [GraphicsLayer] capturing the scrollable background
+ * content so sibling floating glass overlays can sample and blur the exact pixels behind them
+ * in real time on Android 12+ (API 31+).
+ *
+ * Guardrail: Only provide [LocalBackdropGlassState] to sibling overlays rendered ABOVE the
+ * [backdropGlassSource] box — never inside the source itself — and always respect [isRecording].
+ */
+@Stable
+class BackdropGlassState(
+    val layer: GraphicsLayer,
+    val isActive: Boolean,
+) {
+    var sourceOriginInRoot by mutableStateOf(Offset.Zero)
+    var hasContent by mutableStateOf(false)
+    @Volatile var isRecording: Boolean = false
+}
+
+val LocalBackdropGlassState = compositionLocalOf<BackdropGlassState?> { null }
+
+@Composable
+fun rememberBackdropGlassState(enabled: Boolean): BackdropGlassState? {
+    val active = enabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+    if (!active) return null
+    val layer = rememberGraphicsLayer()
+    return remember(layer) { BackdropGlassState(layer = layer, isActive = true) }
+}
+
+/**
+ * Records this composable's draw output into [state] while still drawing normally to the screen,
+ * enabling zero-copy GPU backdrop blur for floating sibling glass surfaces.
+ */
+fun Modifier.backdropGlassSource(state: BackdropGlassState?): Modifier {
+    if (state == null || !state.isActive) return this
+    return this
+        .onGloballyPositioned { coords ->
+            if (coords.isAttached) {
+                state.sourceOriginInRoot = coords.positionInRoot()
+            }
+        }
+        .drawWithContent {
+            state.isRecording = true
+            try {
+                state.layer.record {
+                    this@drawWithContent.drawContent()
+                }
+                if (!state.hasContent) {
+                    state.hasContent = true
+                }
+            } finally {
+                state.isRecording = false
+            }
+            drawLayer(state.layer)
+        }
+}
+
+/**
+ * Shared frosted/solid glass surface.
+ * When [useLiquidGlass] is enabled on Android 12+ (API 31+) with an active [LocalBackdropGlassState],
+ * samples and blurs the live background layer behind the pill before compositing a translucent
+ * smoked/milk glass tint and crisp specular hairline rim.
  */
 @Composable
 fun LiquidGlassPill(
@@ -233,18 +312,32 @@ fun LiquidGlassPill(
     content: @Composable () -> Unit,
 ) {
     val isDark = LocalPocketLinkDarkTheme.current
+    val backdropState = LocalBackdropGlassState.current
+    val liveBlurActive = useLiquidGlass &&
+        backdropState != null &&
+        backdropState.isActive &&
+        !backdropState.isRecording &&
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+    var pillOriginInRoot by remember { mutableStateOf(Offset.Zero) }
+
     val bgBrush = when {
+        isDark && liveBlurActive -> Brush.verticalGradient(
+            listOf(Color(0x6E161923), Color(0x8C0D0F16))
+        )
         isDark && useLiquidGlass -> Brush.verticalGradient(
-            listOf(Color(0xEE1D202A), Color(0xF414161E))
+            listOf(Color(0xD4181B24), Color(0xE210121A))
         )
         isDark -> Brush.verticalGradient(
             listOf(Color(0xFF1A1B20), Color(0xFF161618))
         )
+        liveBlurActive -> Brush.verticalGradient(
+            listOf(Color(0x9CFFFFFF), Color(0xB4EEF2FF))
+        )
         useLiquidGlass -> Brush.linearGradient(
             colors = listOf(
-                Color(0xF5FFFFFF),
-                Color(0xEEF2F5FF),
-                Color(0xF3EAF0FF),
+                Color(0xEAFFFFFF),
+                Color(0xE8F2F5FF),
+                Color(0xEEEAF0FF),
             ),
             start = Offset(0f, 0f),
             end = Offset(420f, 320f),
@@ -255,19 +348,21 @@ fun LiquidGlassPill(
     }
     val borderBrush = when {
         isDark && useLiquidGlass -> Brush.verticalGradient(
-            listOf(Color.White.copy(alpha = 0.26f), Color.White.copy(alpha = 0.10f))
+            listOf(
+                Color.White.copy(alpha = 0.34f),
+                Color.White.copy(alpha = 0.08f),
+                Color.White.copy(alpha = 0.16f),
+            )
         )
         isDark -> Brush.verticalGradient(
             listOf(Color.White.copy(alpha = 0.09f), Color.White.copy(alpha = 0.07f))
         )
-        useLiquidGlass -> Brush.linearGradient(
-            colors = listOf(
-                Color.White.copy(alpha = 0.98f),
-                Color(0xFF8CA0FF).copy(alpha = 0.42f),
-                Color(0xFF4760FA).copy(alpha = 0.28f),
-            ),
-            start = Offset(0f, 0f),
-            end = Offset(300f, 260f),
+        useLiquidGlass -> Brush.verticalGradient(
+            listOf(
+                Color.White.copy(alpha = 0.96f),
+                Color.White.copy(alpha = 0.56f),
+                Color(0xFF8CA0FF).copy(alpha = 0.32f),
+            )
         )
         else -> Brush.verticalGradient(
             listOf(Color(0xFFD2D9EB), Color(0xFFDADFF0))
@@ -277,72 +372,218 @@ fun LiquidGlassPill(
 
     Box(
         modifier = modifier
+            .onGloballyPositioned { coords ->
+                if (liveBlurActive && coords.isAttached) {
+                    pillOriginInRoot = coords.positionInRoot()
+                }
+            }
             .shadow(
-                elevation = if (isDark) 18.dp else if (useLiquidGlass) 16.dp else 8.dp,
+                elevation = if (isDark) 16.dp else if (useLiquidGlass) 14.dp else 8.dp,
                 shape = shape,
-                ambientColor = shadowColor.copy(alpha = if (isDark) 0.48f else if (useLiquidGlass) 0.16f else 0.10f),
-                spotColor = shadowColor.copy(alpha = if (isDark) 0.56f else if (useLiquidGlass) 0.22f else 0.12f),
+                ambientColor = shadowColor.copy(alpha = if (isDark) 0.44f else if (useLiquidGlass) 0.14f else 0.10f),
+                spotColor = shadowColor.copy(alpha = if (isDark) 0.52f else if (useLiquidGlass) 0.20f else 0.12f),
             )
             .clip(shape)
-            .background(bgBrush)
-            .drawWithContent {
-                drawContent()
-                if (useLiquidGlass) {
-                    // Subtle optical specular sheen across the upper glass curvature
-                    drawRect(
-                        brush = Brush.verticalGradient(
-                            colors = listOf(
-                                Color.White.copy(alpha = if (isDark) 0.08f else 0.58f),
-                                Color.Transparent,
-                            ),
-                            startY = 0f,
-                            endY = size.height * 0.42f,
-                        ),
-                        size = Size(size.width, size.height * 0.42f),
-                    )
-                    if (!isDark) {
-                        // Subtle bottom cool refraction rim
+            .border(width = if (useLiquidGlass) 0.95.dp else 1.dp, brush = borderBrush, shape = shape),
+    ) {
+        // Real-time GPU blurred backdrop layer (strictly behind tint & sharp foreground controls)
+        if (liveBlurActive && backdropState != null) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .graphicsLayer {
+                        clip = true
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            val blurPx = 26.dp.toPx()
+                            renderEffect = AndroidRenderEffect
+                                .createBlurEffect(blurPx, blurPx, Shader.TileMode.CLAMP)
+                                .asComposeRenderEffect()
+                        }
+                    }
+                    .drawBehind {
+                        if (backdropState.hasContent && !backdropState.isRecording) {
+                            val dx = backdropState.sourceOriginInRoot.x - pillOriginInRoot.x
+                            val dy = backdropState.sourceOriginInRoot.y - pillOriginInRoot.y
+                            translate(left = dx, top = dy) {
+                                drawLayer(backdropState.layer)
+                            }
+                        }
+                    },
+            )
+        }
+
+        // Translucent frosted glass tint + crisp top specular sheen
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .background(bgBrush)
+                .drawWithContent {
+                    drawContent()
+                    if (useLiquidGlass) {
                         drawRect(
                             brush = Brush.verticalGradient(
                                 colors = listOf(
+                                    Color.White.copy(alpha = if (isDark) 0.08f else 0.42f),
                                     Color.Transparent,
-                                    Color(0xFF4760FA).copy(alpha = 0.06f),
                                 ),
-                                startY = size.height * 0.68f,
-                                endY = size.height,
+                                startY = 0f,
+                                endY = size.height * 0.38f,
                             ),
-                            topLeft = Offset(0f, size.height * 0.68f),
-                            size = Size(size.width, size.height * 0.32f),
+                            size = Size(size.width, size.height * 0.38f),
                         )
                     }
-                }
-            }
-            .border(width = if (!isDark && useLiquidGlass) 1.2.dp else 1.dp, brush = borderBrush, shape = shape),
-    ) {
+                },
+        )
+
         content()
     }
 }
 
 /**
- * Soft atmospheric gradient behind the floating dock / mini player so scrolling content
- * softly dissolves underneath instead of visually overlapping dock controls.
+ * Glassmorphism container designed for full-screen audio & video player UI surfaces.
+ * Uses a dedicated background [Surface] with [Modifier.blur] ([liquidBackdropBlur]) so live
+ * atmospheric backdrop pixels (when [LocalBackdropGlassState] is active) or an ambient luminous
+ * frosting layer are blurred strictly behind the semi-transparent tint, while foreground controls,
+ * labels, and icons remain razor sharp.
  */
 @Composable
-fun FloatingDockScrimBackdrop(modifier: Modifier = Modifier) {
+fun GlassPlayerSurface(
+    modifier: Modifier = Modifier,
+    shape: Shape = RoundedCornerShape(24.dp),
+    containerColor: Color = Color(0xFF10131E).copy(alpha = 0.42f),
+    accentGlow: Color = Color.White,
+    borderColor: Color = Color.White.copy(alpha = 0.24f),
+    blurRadius: Dp = 24.dp,
+    shadowElevation: Dp = 10.dp,
+    contentAlignment: Alignment = Alignment.TopStart,
+    content: @Composable () -> Unit,
+) {
+    val backdropState = LocalBackdropGlassState.current
+    val liveBlurActive = backdropState != null &&
+        backdropState.isActive &&
+        !backdropState.isRecording &&
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+    var originInRoot by remember { mutableStateOf(Offset.Zero) }
+
+    val rimBrush = remember(borderColor) {
+        Brush.verticalGradient(
+            colors = listOf(
+                borderColor.copy(alpha = (borderColor.alpha * 1.45f).coerceAtMost(0.55f)),
+                borderColor.copy(alpha = borderColor.alpha * 0.45f),
+                borderColor.copy(alpha = borderColor.alpha * 0.80f),
+            ),
+        )
+    }
+
+    Surface(
+        modifier = modifier.onGloballyPositioned { coords ->
+            if (liveBlurActive && coords.isAttached) {
+                originInRoot = coords.positionInRoot()
+            }
+        },
+        shape = shape,
+        color = Color.Transparent,
+        border = BorderStroke(0.85.dp, rimBrush),
+        shadowElevation = shadowElevation,
+    ) {
+        Box(contentAlignment = contentAlignment) {
+            // Blurred glass background Surface (strictly behind foreground content)
+            Surface(
+                shape = shape,
+                color = Color.Transparent,
+                modifier = Modifier
+                    .matchParentSize()
+                    .liquidBackdropBlur(blurRadius),
+            ) {
+                if (liveBlurActive && backdropState != null) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .drawBehind {
+                                if (backdropState.hasContent && !backdropState.isRecording) {
+                                    val dx = backdropState.sourceOriginInRoot.x - originInRoot.x
+                                    val dy = backdropState.sourceOriginInRoot.y - originInRoot.y
+                                    translate(left = dx, top = dy) {
+                                        drawLayer(backdropState.layer)
+                                    }
+                                }
+                            },
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(
+                                Brush.linearGradient(
+                                    colors = listOf(
+                                        accentGlow.copy(alpha = 0.16f),
+                                        containerColor.copy(alpha = (containerColor.alpha + 0.14f).coerceAtMost(0.72f)),
+                                        Color(0xFF0A0D16).copy(alpha = (containerColor.alpha + 0.18f).coerceAtMost(0.78f)),
+                                    ),
+                                ),
+                            ),
+                    )
+                }
+            }
+
+            // Semi-transparent frosted glass tint + soft top specular sheen
+            Surface(
+                shape = shape,
+                color = containerColor,
+                modifier = Modifier
+                    .matchParentSize()
+                    .drawWithContent {
+                        drawContent()
+                        drawRect(
+                            brush = Brush.verticalGradient(
+                                colors = listOf(
+                                    Color.White.copy(alpha = 0.14f),
+                                    Color.White.copy(alpha = 0.03f),
+                                    Color.Transparent,
+                                ),
+                                startY = 0f,
+                                endY = size.height * 0.45f,
+                            ),
+                            size = Size(size.width, size.height * 0.45f),
+                        )
+                    },
+            ) {}
+
+            content()
+        }
+    }
+}
+
+/**
+ * Soft atmospheric gradient behind the floating dock / mini player.
+ * Stays light and airy when [useLiquidGlass] is enabled so underlying colors pass behind
+ * the floating pills and visibly blur through the frosted glass surface.
+ */
+@Composable
+fun FloatingDockScrimBackdrop(
+    modifier: Modifier = Modifier,
+    useLiquidGlass: Boolean = true,
+) {
     val bg = MaterialTheme.colorScheme.background
+    val colors = if (useLiquidGlass) {
+        listOf(
+            Color.Transparent,
+            bg.copy(alpha = 0.08f),
+            bg.copy(alpha = 0.22f),
+            bg.copy(alpha = 0.36f),
+        )
+    } else {
+        listOf(
+            Color.Transparent,
+            bg.copy(alpha = 0.55f),
+            bg.copy(alpha = 0.88f),
+            bg.copy(alpha = 0.96f),
+        )
+    }
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .background(
-                Brush.verticalGradient(
-                    colors = listOf(
-                        Color.Transparent,
-                        bg.copy(alpha = 0.55f),
-                        bg.copy(alpha = 0.88f),
-                        bg.copy(alpha = 0.96f),
-                    )
-                )
-            )
+            .background(Brush.verticalGradient(colors = colors))
     )
 }
 
@@ -444,6 +685,7 @@ fun FloatingNavigationDock(
                             DockTabItem(
                                 id = id,
                                 selected = selectedTabId == id,
+                                useLiquidGlass = useLiquidGlass,
                                 onClick = { if (!preview) onSelectTab(id) },
                                 modifier = Modifier
                                     .weight(1f)
@@ -461,6 +703,7 @@ fun FloatingNavigationDock(
 private fun DockTabItem(
     id: String,
     selected: Boolean,
+    useLiquidGlass: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -483,14 +726,23 @@ private fun DockTabItem(
     val isDark = LocalPocketLinkDarkTheme.current
     val activeColor = MaterialTheme.colorScheme.primary
     val pillBg by animateColorAsState(
-        targetValue = if (selected) activeColor.copy(alpha = if (isDark) 0.16f else 0.14f) else Color.Transparent,
+        targetValue = when {
+            !selected -> Color.Transparent
+            isDark && useLiquidGlass -> Color.White.copy(alpha = 0.15f)
+            !isDark && useLiquidGlass -> Color(0xFF1B2340).copy(alpha = 0.09f)
+            else -> activeColor.copy(alpha = if (isDark) 0.16f else 0.14f)
+        },
         animationSpec = tween(220, easing = FastOutSlowInEasing),
         label = "dock_tab_bg",
     )
     val contentTint by animateColorAsState(
         targetValue = when {
+            isDark && useLiquidGlass && selected -> Color.White
+            isDark && useLiquidGlass -> Color.White.copy(alpha = 0.62f)
             isDark && selected -> Color(0xFF9FB0FF)
             isDark -> Color(0xFFA7AEC2)
+            !isDark && useLiquidGlass && selected -> Color(0xFF141B33)
+            !isDark && useLiquidGlass -> Color(0xFF454E68)
             selected -> Color(0xFF3950F5)
             else -> Color(0xFF4D5570)
         },
@@ -510,9 +762,14 @@ private fun DockTabItem(
             .background(pillBg)
             .then(
                 if (selected) Modifier.border(
-                    1.dp,
-                    if (isDark) activeColor.copy(alpha = 0.22f) else activeColor.copy(alpha = 0.28f),
-                    RoundedCornerShape(26.dp),
+                    width = if (useLiquidGlass) 0.8.dp else 1.dp,
+                    color = when {
+                        isDark && useLiquidGlass -> Color.White.copy(alpha = 0.22f)
+                        !isDark && useLiquidGlass -> Color.White.copy(alpha = 0.72f)
+                        isDark -> activeColor.copy(alpha = 0.22f)
+                        else -> activeColor.copy(alpha = 0.28f)
+                    },
+                    shape = RoundedCornerShape(26.dp),
                 )
                 else Modifier
             )
@@ -752,6 +1009,7 @@ data class ShortcutDescriptor(
 object ShortcutCatalog {
     val items = listOf(
         ShortcutDescriptor("explore", "Explore", "Browse all destinations", Icons.Rounded.Explore, IndigoPrimary),
+        ShortcutDescriptor("yt_music", "Discover", "Stream via NewPipe · charts & lyrics", Icons.Rounded.LibraryMusic, VioletAccent),
         ShortcutDescriptor("files", "Files", "Browse server folders", Icons.Rounded.Folder, SkyAccent),
         ShortcutDescriptor("music", "Music", "Browse your music library", Icons.Rounded.MusicNote, VioletAccent),
         ShortcutDescriptor("videos", "Videos", "Browse movies and clips", Icons.Rounded.PlayCircle, TealAccent),
@@ -882,6 +1140,7 @@ fun RouteBadge(routeType: NetworkRouteType, modifier: Modifier = Modifier) {
     val tint = when (routeType) {
         NetworkRouteType.LOCALHOST -> colors.cyan
         NetworkRouteType.TAILSCALE -> colors.emerald
+        NetworkRouteType.CLOUDFLARE -> colors.cloudflare
         NetworkRouteType.HTTPS -> MaterialTheme.colorScheme.primary
         NetworkRouteType.PRIVATE_LAN -> colors.sky
         NetworkRouteType.PUBLIC -> colors.amber
@@ -973,6 +1232,8 @@ fun PersistentMiniPlayer(
     state: AudioPlaybackState,
     visible: Boolean,
     useLiquidGlass: Boolean = true,
+    imageLoader: ImageLoader? = null,
+    showArtwork: Boolean = true,
     onOpenNowPlaying: () -> Unit,
     onTogglePlayPause: () -> Unit,
     onPrevious: () -> Unit,
@@ -983,6 +1244,7 @@ fun PersistentMiniPlayer(
 ) {
     val track = state.currentTrack
     val haptic = LocalHapticFeedback.current
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val horizontalDrag = remember { Animatable(0f) }
 
@@ -1076,7 +1338,20 @@ fun PersistentMiniPlayer(
                                 .background(pillBadgeBg),
                             contentAlignment = Alignment.Center,
                         ) {
-                            if (state.isPlaying) {
+                            val hasArt = showArtwork && !track.artworkUrl.isNullOrBlank() && imageLoader != null
+                            if (hasArt) {
+                                AsyncImage(
+                                    model = ImageRequest.Builder(context)
+                                        .data(track.artworkUrl)
+                                        .size(160)
+                                        .crossfade(true)
+                                        .build(),
+                                    imageLoader = imageLoader!!,
+                                    contentDescription = track.displayTitle,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.matchParentSize(),
+                                )
+                            } else if (state.isPlaying) {
                                 AnimatedEqualizer(
                                     color = pillAccent,
                                     modifier = Modifier.scale(0.75f),
@@ -1102,7 +1377,7 @@ fun PersistentMiniPlayer(
                         ) {
                             Column {
                                 Text(
-                                    text = track.name.substringBeforeLast('.').replace('_', ' '),
+                                    text = track.displayTitle,
                                     style = MaterialTheme.typography.titleSmall,
                                     fontWeight = FontWeight.Bold,
                                     color = pillPrimaryInk,
@@ -1110,11 +1385,19 @@ fun PersistentMiniPlayer(
                                     overflow = TextOverflow.Ellipsis,
                                 )
                                 Text(
-                                    text = if (state.isPlaying) "NOW PLAYING · SWIPE TO SKIP" else "PAUSED · SWIPE TO SKIP",
+                                    text = when {
+                                        !track.artist.isNullOrBlank() && state.isPlaying -> "${track.artist} · PLAYING"
+                                        !track.artist.isNullOrBlank() && state.isBuffering -> "${track.artist} · BUFFERING"
+                                        !track.artist.isNullOrBlank() -> "${track.artist} · PAUSED"
+                                        state.isPlaying -> "NOW PLAYING · SWIPE TO SKIP"
+                                        state.isBuffering -> "BUFFERING STREAM…"
+                                        else -> "PAUSED · SWIPE TO SKIP"
+                                    },
                                     fontSize = 9.sp,
                                     letterSpacing = 0.9.sp,
                                     color = pillMutedInk,
                                     maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
                                 )
                             }
                         }
@@ -1137,18 +1420,34 @@ fun PersistentMiniPlayer(
                                 .testTag("mini_player_play_pause"),
                         ) {
                             AnimatedContent(
-                                targetState = state.isPlaying,
+                                targetState = when {
+                                    state.isPlaying -> "pause"
+                                    state.isBuffering -> "buffering"
+                                    else -> "play"
+                                },
                                 transitionSpec = {
                                     (scaleIn(initialScale = 0.75f, animationSpec = tween(160)) + fadeIn(tween(140)))
                                         .togetherWith(scaleOut(targetScale = 0.75f, animationSpec = tween(120)) + fadeOut(tween(120)))
                                 },
                                 label = "mini_player_play_icon",
-                            ) { playing ->
-                                Icon(
-                                    imageVector = if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                                    contentDescription = if (playing) "Pause" else "Play",
-                                    tint = pillAccent,
-                                )
+                            ) { mode ->
+                                when (mode) {
+                                    "buffering" -> CircularProgressIndicator(
+                                        color = pillAccent,
+                                        strokeWidth = 2.dp,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                    "pause" -> Icon(
+                                        imageVector = Icons.Rounded.Pause,
+                                        contentDescription = "Pause",
+                                        tint = pillAccent,
+                                    )
+                                    else -> Icon(
+                                        imageVector = Icons.Rounded.PlayArrow,
+                                        contentDescription = "Play",
+                                        tint = pillAccent,
+                                    )
+                                }
                             }
                         }
                         IconButton(

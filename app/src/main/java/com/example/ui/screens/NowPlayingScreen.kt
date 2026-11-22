@@ -50,13 +50,17 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
+import androidx.compose.material.icons.rounded.AllInclusive
+import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.Lyrics
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -65,15 +69,19 @@ import androidx.compose.material.icons.rounded.RepeatOne
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -82,6 +90,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -89,7 +98,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
@@ -98,13 +109,23 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import coil.ImageLoader
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.example.data.model.AppSettingsState
+import com.example.data.model.YtAudioQuality
 import com.example.data.model.formatDurationMs
+import com.example.data.network.TrackLyrics
 import com.example.media.AudioPlaybackController
 import com.example.media.AudioPlaybackState
 import com.example.media.RepeatModeState
 import com.example.ui.components.AnimatedEqualizer
+import com.example.ui.components.GlassPlayerSurface
+import com.example.ui.components.LocalBackdropGlassState
 import com.example.ui.components.ShortcutCatalog
+import com.example.ui.components.backdropGlassSource
+import com.example.ui.components.liquidBackdropBlur
+import com.example.ui.components.rememberBackdropGlassState
 import com.example.ui.theme.LocalPocketLinkColors
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -152,6 +173,15 @@ fun NowPlayingScreen(
     showStatsForNerds: Boolean,
     enableGestures: Boolean = true,
     shortcuts: List<String> = AppSettingsState.DEFAULT_FLOATING_SHORTCUTS,
+    imageLoader: ImageLoader? = null,
+    showArtwork: Boolean = true,
+    lyricsEnabled: Boolean = true,
+    lyrics: TrackLyrics? = null,
+    ytAudioQuality: YtAudioQuality = YtAudioQuality.AUTO,
+    autoplayEnabled: Boolean = true,
+    onToggleAutoplay: (Boolean) -> Unit = {},
+    onLoadMoreSuggestions: () -> Unit = {},
+    onChangeYtAudioQuality: (YtAudioQuality) -> Unit = {},
     onSelectShortcut: (String) -> Unit = {},
     onBack: () -> Unit,
 ) {
@@ -159,22 +189,37 @@ fun NowPlayingScreen(
     var showQueueSheet by remember { mutableStateOf(false) }
     var showShortcutsSheet by remember { mutableStateOf(false) }
     var showSpeedStrip by remember { mutableStateOf(false) }
+    var showQualityStrip by remember { mutableStateOf(false) }
+    var showLyricsPane by remember { mutableStateOf(false) }
     var scrubbingPosition by remember { mutableStateOf<Float?>(null) }
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
+    val context = LocalContext.current
     val dismissOffsetY = remember { Animatable(0f) }
     val artworkOffsetX = remember { Animatable(0f) }
     val colors = LocalPocketLinkColors.current
 
-    BackHandler(enabled = showQueueSheet || showShortcutsSheet || showSpeedStrip) {
-        showQueueSheet = false
-        showShortcutsSheet = false
-        showSpeedStrip = false
+    BackHandler(enabled = showSpeedStrip || showQualityStrip || showLyricsPane) {
+        when {
+            showLyricsPane -> showLyricsPane = false
+            showQualityStrip -> showQualityStrip = false
+            else -> showSpeedStrip = false
+        }
     }
 
-    val folderName = remember(track?.parentPath, track?.volume) {
-        val raw = track?.parentPath?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
-        raw ?: if (track?.volume == "internal" || track?.volume == null) "PocketLink Library" else track.volume
+    LaunchedEffect(lyricsEnabled) {
+        if (!lyricsEnabled) showLyricsPane = false
+    }
+
+    val folderName = remember(track?.parentPath, track?.volume, track?.isYouTubeStream, track?.isLocalLosslessMatch) {
+        when {
+            track?.isLocalLosslessMatch == true -> "Discover · Lossless"
+            track?.isYouTubeStream == true -> "Discover"
+            else -> {
+                val raw = track?.parentPath?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+                raw ?: if (track?.volume == "internal" || track?.volume == null) "PocketLink Library" else track.volume
+            }
+        }
     }
 
     val targetAtmosphere = remember(track?.path) {
@@ -198,9 +243,11 @@ fun NowPlayingScreen(
     )
 
     val inkPrimary = Color.White
-    val inkSecondary = Color.White.copy(alpha = 0.68f)
-    val inkMuted = Color.White.copy(alpha = 0.50f)
+    val inkSecondary = Color.White.copy(alpha = 0.72f)
+    val inkMuted = Color.White.copy(alpha = 0.54f)
     val frostedPillBg = Color.White.copy(alpha = 0.14f)
+    val playerBackdropState = rememberBackdropGlassState(enabled = true)
+    val hasBackdropArt = showArtwork && !track?.artworkUrl.isNullOrBlank() && imageLoader != null
 
     val dragProgress = (dismissOffsetY.value / 220f).coerceIn(0f, 1f)
 
@@ -217,46 +264,71 @@ fun NowPlayingScreen(
             }
             .background(baseColor),
     ) {
-        // Apple Music dynamic blurred-color atmospheric mesh backdrop
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            drawRect(
-                brush = Brush.verticalGradient(
-                    colors = listOf(
-                        glowPrimary.copy(alpha = 0.42f),
-                        glowSecondary.copy(alpha = 0.24f),
-                        baseColor.copy(alpha = 0.96f),
+        // Real-time blurred artwork + dynamic atmospheric glow source captured for glassmorphic player Surfaces
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .backdropGlassSource(playerBackdropState),
+        ) {
+            if (hasBackdropArt && track != null) {
+                AsyncImage(
+                    model = ImageRequest.Builder(context)
+                        .data(track.artworkUrl)
+                        .size(360)
+                        .crossfade(true)
+                        .build(),
+                    imageLoader = imageLoader!!,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .scale(1.18f)
+                        .liquidBackdropBlur(42.dp),
+                )
+            }
+
+            // Dynamic blurred-color atmospheric mesh overlay
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(
+                            glowPrimary.copy(alpha = if (hasBackdropArt) 0.28f else 0.46f),
+                            glowSecondary.copy(alpha = if (hasBackdropArt) 0.20f else 0.28f),
+                            baseColor.copy(alpha = if (hasBackdropArt) 0.76f else 0.96f),
+                        ),
                     ),
-                ),
-            )
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colors = listOf(glowPrimary.copy(alpha = 0.48f), Color.Transparent),
+                )
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(glowPrimary.copy(alpha = if (hasBackdropArt) 0.34f else 0.52f), Color.Transparent),
+                        center = Offset(size.width * 0.22f, size.height * 0.22f),
+                        radius = size.maxDimension * 0.62f,
+                    ),
                     center = Offset(size.width * 0.22f, size.height * 0.22f),
                     radius = size.maxDimension * 0.62f,
-                ),
-                center = Offset(size.width * 0.22f, size.height * 0.22f),
-                radius = size.maxDimension * 0.62f,
-            )
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colors = listOf(glowSecondary.copy(alpha = 0.42f), Color.Transparent),
+                )
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(glowSecondary.copy(alpha = if (hasBackdropArt) 0.30f else 0.44f), Color.Transparent),
+                        center = Offset(size.width * 0.85f, size.height * 0.48f),
+                        radius = size.maxDimension * 0.58f,
+                    ),
                     center = Offset(size.width * 0.85f, size.height * 0.48f),
                     radius = size.maxDimension * 0.58f,
-                ),
-                center = Offset(size.width * 0.85f, size.height * 0.48f),
-                radius = size.maxDimension * 0.58f,
-            )
-            drawRect(
-                brush = Brush.verticalGradient(
-                    colors = listOf(
-                        Color.Black.copy(alpha = 0.10f),
-                        Color.Black.copy(alpha = 0.28f),
-                        Color.Black.copy(alpha = 0.56f),
+                )
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(
+                            Color.Black.copy(alpha = 0.16f),
+                            Color.Black.copy(alpha = 0.30f),
+                            Color.Black.copy(alpha = 0.58f),
+                        ),
                     ),
-                ),
-            )
+                )
+            }
         }
 
+        CompositionLocalProvider(LocalBackdropGlassState provides playerBackdropState) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -290,17 +362,17 @@ fun NowPlayingScreen(
                 ),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            // Apple Music top grabber pill
+            // Top grabber pill
             Spacer(Modifier.height(10.dp))
             Box(
                 modifier = Modifier
                     .width(38.dp)
                     .height(5.dp)
                     .clip(RoundedCornerShape(50))
-                    .background(Color.White.copy(alpha = 0.36f)),
+                    .background(Color.White.copy(alpha = 0.38f)),
             )
 
-            // Minimal translucent top header bar
+            // Frosted glass top header controls
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -317,12 +389,14 @@ fun NowPlayingScreen(
                         .testTag("now_playing_minimize_btn"),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .size(34.dp)
-                            .clip(CircleShape)
-                            .background(frostedPillBg),
+                    GlassPlayerSurface(
+                        shape = CircleShape,
+                        containerColor = Color.White.copy(alpha = 0.14f),
+                        accentGlow = glowPrimary,
+                        blurRadius = 18.dp,
+                        shadowElevation = 4.dp,
                         contentAlignment = Alignment.Center,
+                        modifier = Modifier.size(36.dp),
                     ) {
                         Icon(
                             Icons.Rounded.KeyboardArrowDown,
@@ -333,21 +407,31 @@ fun NowPlayingScreen(
                     }
                 }
 
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
+                Box(
                     modifier = Modifier
                         .weight(1f)
-                        .padding(horizontal = 8.dp),
+                        .padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Text(
-                        text = folderName.uppercase(),
-                        fontSize = 11.sp,
-                        letterSpacing = 1.3.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = inkSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    GlassPlayerSurface(
+                        shape = RoundedCornerShape(50),
+                        containerColor = Color.Black.copy(alpha = 0.22f),
+                        accentGlow = glowPrimary,
+                        borderColor = Color.White.copy(alpha = 0.20f),
+                        blurRadius = 18.dp,
+                        shadowElevation = 2.dp,
+                    ) {
+                        Text(
+                            text = folderName.uppercase(),
+                            fontSize = 11.sp,
+                            letterSpacing = 1.3.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = inkPrimary.copy(alpha = 0.88f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                        )
+                    }
                 }
 
                 Box(
@@ -358,12 +442,14 @@ fun NowPlayingScreen(
                         .testTag("now_playing_shortcuts_btn"),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .size(34.dp)
-                            .clip(CircleShape)
-                            .background(frostedPillBg),
+                    GlassPlayerSurface(
+                        shape = CircleShape,
+                        containerColor = Color.White.copy(alpha = 0.14f),
+                        accentGlow = glowSecondary,
+                        blurRadius = 18.dp,
+                        shadowElevation = 4.dp,
                         contentAlignment = Alignment.Center,
+                        modifier = Modifier.size(36.dp),
                     ) {
                         Icon(
                             Icons.Rounded.GridView,
@@ -415,124 +501,250 @@ fun NowPlayingScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.SpaceBetween,
             ) {
-                // Hero Square Artwork with Apple Music play/pause scale physics
+                // Hero Square Artwork (or Synced Lyrics View) with Apple Music play/pause scale physics
                 Box(
                     modifier = Modifier
                         .weight(1f, fill = true)
                         .fillMaxWidth(),
                     contentAlignment = Alignment.Center,
                 ) {
-                    AnimatedContent(
-                        targetState = track.path,
-                        transitionSpec = {
-                            (scaleIn(initialScale = 0.92f) + fadeIn(tween(240))) togetherWith
-                                (scaleOut(targetScale = 0.92f) + fadeOut(tween(180)))
-                        },
-                        label = "am_artwork_transition",
-                    ) { _ ->
-                        Box(
+                    if (lyricsEnabled && showLyricsPane) {
+                        val listState = rememberLazyListState()
+                        val lines = lyrics?.lines.orEmpty()
+                        val activeLineIdx = remember(lines, playbackState.positionMs, lyrics?.isSynced) {
+                            if (lyrics?.isSynced != true || lines.isEmpty()) -1
+                            else lines.indexOfLast { it.timeMs <= playbackState.positionMs + 250L }
+                        }
+                        LaunchedEffect(activeLineIdx) {
+                            if (activeLineIdx >= 0 && lyrics?.isSynced == true) {
+                                listState.animateScrollToItem((activeLineIdx - 1).coerceAtLeast(0))
+                            }
+                        }
+                        GlassPlayerSurface(
+                            shape = RoundedCornerShape(24.dp),
+                            containerColor = Color.Black.copy(alpha = 0.30f),
+                            accentGlow = glowPrimary,
+                            borderColor = Color.White.copy(alpha = 0.24f),
+                            blurRadius = 26.dp,
+                            shadowElevation = 14.dp,
+                            contentAlignment = Alignment.Center,
                             modifier = Modifier
-                                .offset { IntOffset(artworkOffsetX.value.roundToInt(), 0) }
-                                .fillMaxWidth(0.92f)
+                                .fillMaxWidth(0.96f)
                                 .aspectRatio(1f)
-                                .graphicsLayer {
-                                    scaleX = artworkScale
-                                    scaleY = artworkScale
-                                }
-                                .shadow(
-                                    elevation = artworkShadowDp,
-                                    shape = RoundedCornerShape(16.dp),
-                                    ambientColor = Color.Black.copy(alpha = 0.75f),
-                                    spotColor = glowPrimary.copy(alpha = 0.55f),
-                                )
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(
-                                    Brush.linearGradient(
-                                        colors = listOf(
-                                            glowPrimary,
-                                            glowSecondary,
-                                            baseColor.copy(alpha = 0.92f),
-                                        ),
+                                .testTag("now_playing_lyrics_pane"),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 18.dp, vertical = 14.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                            if (lines.isEmpty()) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.Lyrics,
+                                        contentDescription = null,
+                                        tint = Color.White.copy(alpha = 0.6f),
+                                        modifier = Modifier.size(34.dp),
                                     )
-                                )
-                                .border(1.dp, Color.White.copy(alpha = 0.22f), RoundedCornerShape(16.dp))
-                                .then(
-                                    if (enableGestures) {
-                                        Modifier.pointerInput(track.path) {
-                                            var totalX = 0f
-                                            detectHorizontalDragGestures(
-                                                onDragStart = { totalX = 0f },
-                                                onHorizontalDrag = { _, delta ->
-                                                    totalX += delta
-                                                    scope.launch {
-                                                        artworkOffsetX.snapTo((totalX * 0.45f).coerceIn(-90f, 90f))
-                                                    }
-                                                },
-                                                onDragEnd = {
-                                                    val goNext = totalX < -80f
-                                                    val goPrev = totalX > 80f
-                                                    scope.launch {
-                                                        artworkOffsetX.animateTo(0f, spring(dampingRatio = Spring.DampingRatioMediumBouncy))
-                                                    }
-                                                    if (goNext) {
-                                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                        audioController.next()
-                                                    } else if (goPrev) {
-                                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                        audioController.previous()
-                                                    }
-                                                },
-                                                onDragCancel = { scope.launch { artworkOffsetX.animateTo(0f, spring()) } },
+                                    Text(
+                                        text = "No lyrics found for this track",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = inkSecondary,
+                                    )
+                                }
+                            } else {
+                                LazyColumn(
+                                    state = listState,
+                                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                                    contentPadding = PaddingValues(vertical = 24.dp),
+                                    modifier = Modifier.fillMaxSize(),
+                                ) {
+                                    itemsIndexed(lines) { idx, line ->
+                                        val isCurrent = idx == activeLineIdx
+                                        Text(
+                                            text = line.text,
+                                            style = MaterialTheme.typography.titleMedium.copy(
+                                                fontSize = if (isCurrent) 20.sp else 16.sp,
+                                                fontWeight = if (isCurrent) FontWeight.ExtraBold else FontWeight.SemiBold,
+                                                lineHeight = if (isCurrent) 26.sp else 22.sp,
+                                            ),
+                                            color = when {
+                                                lyrics?.isSynced != true -> Color.White.copy(alpha = 0.88f)
+                                                isCurrent -> Color.White
+                                                idx < activeLineIdx -> Color.White.copy(alpha = 0.42f)
+                                                else -> Color.White.copy(alpha = 0.62f)
+                                            },
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(10.dp))
+                                                .clickable(enabled = lyrics?.isSynced == true) {
+                                                    audioController.seekTo(line.timeMs)
+                                                }
+                                                .padding(vertical = 2.dp),
+                                        )
+                                    }
+                                }
+                            }
+                            }
+                        }
+                    } else {
+                        AnimatedContent(
+                            targetState = track.path,
+                            transitionSpec = {
+                                (scaleIn(initialScale = 0.92f) + fadeIn(tween(240))) togetherWith
+                                    (scaleOut(targetScale = 0.92f) + fadeOut(tween(180)))
+                            },
+                            label = "am_artwork_transition",
+                        ) { _ ->
+                            val hasRemoteArt = showArtwork && !track.artworkUrl.isNullOrBlank() && imageLoader != null
+                            Box(
+                                modifier = Modifier
+                                    .offset { IntOffset(artworkOffsetX.value.roundToInt(), 0) }
+                                    .fillMaxWidth(0.92f)
+                                    .aspectRatio(1f)
+                                    .graphicsLayer {
+                                        scaleX = artworkScale
+                                        scaleY = artworkScale
+                                    }
+                                    .shadow(
+                                        elevation = artworkShadowDp,
+                                        shape = RoundedCornerShape(16.dp),
+                                        ambientColor = Color.Black.copy(alpha = 0.75f),
+                                        spotColor = glowPrimary.copy(alpha = 0.55f),
+                                    )
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(
+                                        Brush.linearGradient(
+                                            colors = listOf(
+                                                glowPrimary,
+                                                glowSecondary,
+                                                baseColor.copy(alpha = 0.92f),
+                                            ),
+                                        )
+                                    )
+                                    .border(1.dp, Color.White.copy(alpha = 0.22f), RoundedCornerShape(16.dp))
+                                    .then(
+                                        if (enableGestures) {
+                                            Modifier.pointerInput(track.path) {
+                                                var totalX = 0f
+                                                detectHorizontalDragGestures(
+                                                    onDragStart = { totalX = 0f },
+                                                    onHorizontalDrag = { _, delta ->
+                                                        totalX += delta
+                                                        scope.launch {
+                                                            artworkOffsetX.snapTo((totalX * 0.45f).coerceIn(-90f, 90f))
+                                                        }
+                                                    },
+                                                    onDragEnd = {
+                                                        val goNext = totalX < -80f
+                                                        val goPrev = totalX > 80f
+                                                        scope.launch {
+                                                            artworkOffsetX.animateTo(0f, spring(dampingRatio = Spring.DampingRatioMediumBouncy))
+                                                        }
+                                                        if (goNext) {
+                                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                            audioController.next()
+                                                        } else if (goPrev) {
+                                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                            audioController.previous()
+                                                        }
+                                                    },
+                                                    onDragCancel = { scope.launch { artworkOffsetX.animateTo(0f, spring()) } },
+                                                )
+                                            }
+                                        } else Modifier
+                                    ),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                if (hasRemoteArt) {
+                                    AsyncImage(
+                                        model = ImageRequest.Builder(context)
+                                            .data(track.artworkUrl)
+                                            .size(800)
+                                            .crossfade(true)
+                                            .build(),
+                                        imageLoader = imageLoader!!,
+                                        contentDescription = track.displayTitle,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize(),
+                                    )
+                                    if (playbackState.isPlaying) {
+                                        Box(
+                                            modifier = Modifier
+                                                .align(Alignment.BottomEnd)
+                                                .padding(12.dp)
+                                                .size(34.dp)
+                                                .clip(CircleShape)
+                                                .background(Color.Black.copy(alpha = 0.58f)),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            AnimatedEqualizer(
+                                                color = Color.White,
+                                                modifier = Modifier.scale(0.7f),
                                             )
                                         }
-                                    } else Modifier
-                                ),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            // Subtle Apple-style soft radial sheen over album square
-                            Canvas(modifier = Modifier.fillMaxSize()) {
-                                drawCircle(
-                                    brush = Brush.radialGradient(
-                                        colors = listOf(Color.White.copy(alpha = 0.22f), Color.Transparent),
-                                        center = Offset(size.width * 0.25f, size.height * 0.20f),
-                                        radius = size.width * 0.75f,
-                                    ),
-                                    center = Offset(size.width * 0.25f, size.height * 0.20f),
-                                    radius = size.width * 0.75f,
-                                )
-                            }
-                            if (playbackState.isPlaying) {
-                                AnimatedEqualizer(
-                                    color = Color.White.copy(alpha = 0.94f),
-                                    modifier = Modifier.size(64.dp),
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Rounded.MusicNote,
-                                    contentDescription = null,
-                                    tint = Color.White.copy(alpha = 0.92f),
-                                    modifier = Modifier.size(92.dp),
-                                )
+                                    }
+                                } else {
+                                    Canvas(modifier = Modifier.fillMaxSize()) {
+                                        drawCircle(
+                                            brush = Brush.radialGradient(
+                                                colors = listOf(Color.White.copy(alpha = 0.22f), Color.Transparent),
+                                                center = Offset(size.width * 0.25f, size.height * 0.20f),
+                                                radius = size.width * 0.75f,
+                                            ),
+                                            center = Offset(size.width * 0.25f, size.height * 0.20f),
+                                            radius = size.width * 0.75f,
+                                        )
+                                    }
+                                    if (playbackState.isPlaying) {
+                                        AnimatedEqualizer(
+                                            color = Color.White.copy(alpha = 0.94f),
+                                            modifier = Modifier.size(64.dp),
+                                        )
+                                    } else {
+                                        Icon(
+                                            imageVector = Icons.Rounded.MusicNote,
+                                            contentDescription = null,
+                                            tint = Color.White.copy(alpha = 0.92f),
+                                            modifier = Modifier.size(92.dp),
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
                 }
 
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(14.dp))
 
-                // Apple Music Left-Aligned Title / Folder Subtitle + Frosted Right Pills
-                Column(
+                // Glassmorphic Lower Player Control Deck (blurred translucent Surface container)
+                GlassPlayerSurface(
+                    shape = RoundedCornerShape(28.dp),
+                    containerColor = Color(0xFF0E111B).copy(alpha = 0.36f),
+                    accentGlow = glowPrimary,
+                    borderColor = Color.White.copy(alpha = 0.26f),
+                    blurRadius = 26.dp,
+                    shadowElevation = 14.dp,
                     modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 18.dp, vertical = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = track.name.substringBeforeLast('.').replace('_', ' '),
+                                text = track.displayTitle,
                                 style = MaterialTheme.typography.titleLarge.copy(
                                     fontSize = 22.sp,
                                     fontWeight = FontWeight.Bold,
@@ -543,8 +755,13 @@ fun NowPlayingScreen(
                                 modifier = Modifier.basicMarquee(),
                             )
                             Spacer(Modifier.height(2.dp))
+                            val subtitleText = if (!track.artist.isNullOrBlank()) {
+                                "${track.artist} · ${playbackState.routeLabel.ifBlank { folderName }}"
+                            } else {
+                                "$folderName · ${playbackState.routeLabel.ifBlank { "Private Stream" }}"
+                            }
                             Text(
-                                text = "$folderName · ${playbackState.routeLabel.ifBlank { "Private Stream" }}",
+                                text = subtitleText,
                                 style = MaterialTheme.typography.bodyMedium.copy(
                                     fontSize = 15.sp,
                                     fontWeight = FontWeight.Medium,
@@ -553,21 +770,94 @@ fun NowPlayingScreen(
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
-                            playbackState.errorMessage?.let { err ->
+                            if (playbackState.isBuffering && !playbackState.isPlaying && playbackState.errorMessage == null) {
                                 Spacer(Modifier.height(4.dp))
                                 Text(
-                                    text = err,
+                                    text = "Buffering stream…",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = Color(0xFFFF8A8A),
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
+                                    color = Color.White.copy(alpha = 0.78f),
+                                )
+                            }
+                            playbackState.errorMessage?.let { err ->
+                                Spacer(Modifier.height(6.dp))
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Text(
+                                        text = err,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color(0xFFFF8A8A),
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    Surface(
+                                        onClick = { audioController.retryCurrentTrack() },
+                                        shape = RoundedCornerShape(50),
+                                        color = Color.White.copy(alpha = 0.18f),
+                                        border = BorderStroke(0.5.dp, Color.White.copy(alpha = 0.30f)),
+                                    ) {
+                                        Text(
+                                            text = "Retry",
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.White,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        if (lyricsEnabled) {
+                            Surface(
+                                onClick = { showLyricsPane = !showLyricsPane },
+                                shape = CircleShape,
+                                color = if (showLyricsPane) {
+                                    Color.White.copy(alpha = 0.28f)
+                                } else {
+                                    frostedPillBg
+                                },
+                                border = BorderStroke(0.5.dp, Color.White.copy(alpha = 0.20f)),
+                                modifier = Modifier.testTag("now_playing_lyrics_btn"),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Lyrics,
+                                    contentDescription = if (showLyricsPane) "Show artwork" else "Show lyrics",
+                                    tint = inkPrimary,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp).size(16.dp),
+                                )
+                            }
+                        }
+
+                        if (track.isYouTubeStream) {
+                            Surface(
+                                onClick = {
+                                    showQualityStrip = !showQualityStrip
+                                    if (showQualityStrip) showSpeedStrip = false
+                                },
+                                shape = CircleShape,
+                                color = if (showQualityStrip) Color.White.copy(alpha = 0.28f) else frostedPillBg,
+                                border = BorderStroke(0.5.dp, Color.White.copy(alpha = 0.22f)),
+                                modifier = Modifier.testTag("now_playing_quality_btn"),
+                            ) {
+                                Text(
+                                    text = ytAudioQuality.shortLabel,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = inkPrimary,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
                                 )
                             }
                         }
 
                         // Compact frosted playback-speed pill
                         Surface(
-                            onClick = { showSpeedStrip = !showSpeedStrip },
+                            onClick = {
+                                showSpeedStrip = !showSpeedStrip
+                                if (showSpeedStrip) showQualityStrip = false
+                            },
                             shape = CircleShape,
                             color = if (showSpeedStrip || playbackState.speed != 1.0f) {
                                 Color.White.copy(alpha = 0.24f)
@@ -583,6 +873,39 @@ fun NowPlayingScreen(
                                 color = inkPrimary,
                                 modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
                             )
+                        }
+                    }
+
+                    // Animated expandable frosted quality strip (Auto / High / Medium / Low)
+                    AnimatedVisibility(
+                        visible = showQualityStrip && track.isYouTubeStream,
+                        enter = expandVertically(tween(180)) + fadeIn(tween(180)),
+                        exit = shrinkVertically(tween(150)) + fadeOut(tween(150)),
+                    ) {
+                        LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            items(YtAudioQuality.entries) { tier ->
+                                val selected = ytAudioQuality == tier
+                                Surface(
+                                    onClick = {
+                                        onChangeYtAudioQuality(tier)
+                                        showQualityStrip = false
+                                    },
+                                    shape = RoundedCornerShape(50),
+                                    color = if (selected) Color.White else frostedPillBg,
+                                    modifier = Modifier.testTag("now_playing_quality_${tier.prefKey}"),
+                                ) {
+                                    Text(
+                                        text = tier.shortLabel,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (selected) Color.Black else Color.White,
+                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+                                    )
+                                }
+                            }
                         }
                     }
 
@@ -619,16 +942,23 @@ fun NowPlayingScreen(
                     }
 
                     // Signature Apple Music Translucent Capsule Scrubber Bar
-                    val trackFormat = track.name.substringAfterLast('.', "AUDIO").uppercase()
+                    val trackFormat = when {
+                        track.isLocalLosslessMatch ->
+                            track.localLosslessBadge?.ifBlank { null } ?: playbackState.streamBadge.ifBlank { "LOCAL LOSSLESS" }
+                        track.isYouTubeStream ->
+                            playbackState.streamBadge.ifBlank { "DISCOVER" }
+                        else ->
+                            track.name.substringAfterLast('.', "AUDIO").uppercase()
+                    }
                     AppleMusicScrubber(
                         positionMs = sliderValue.toLong(),
                         durationMs = playbackState.durationMs,
                         isScrubbing = isScrubbing,
                         badgeLabel = trackFormat,
                         onScrub = { newPos -> scrubbingPosition = newPos.toFloat() },
-                        onScrubEnd = {
-                            scrubbingPosition?.let { audioController.seekTo(it.toLong()) }
+                        onScrubEnd = { targetMs ->
                             scrubbingPosition = null
+                            audioController.seekTo(targetMs)
                         },
                     )
 
@@ -659,32 +989,51 @@ fun NowPlayingScreen(
                             )
                         }
 
-                        Box(
+                        Surface(
+                            onClick = { audioController.togglePlayPause() },
+                            shape = CircleShape,
+                            color = Color.White.copy(alpha = 0.18f),
+                            border = BorderStroke(0.9.dp, Color.White.copy(alpha = 0.34f)),
                             modifier = Modifier
-                                .size(82.dp)
-                                .clip(CircleShape)
-                                .clickable(
-                                    interactionSource = remember { MutableInteractionSource() },
-                                    indication = ripple(color = Color.White, bounded = true),
-                                    onClick = { audioController.togglePlayPause() },
-                                )
+                                .size(78.dp)
                                 .testTag("now_playing_play_pause_btn"),
-                            contentAlignment = Alignment.Center,
                         ) {
-                            AnimatedContent(
-                                targetState = playbackState.isPlaying,
-                                transitionSpec = {
-                                    (scaleIn(initialScale = 0.78f, animationSpec = tween(160)) + fadeIn(tween(140)))
-                                        .togetherWith(scaleOut(targetScale = 0.78f, animationSpec = tween(120)) + fadeOut(tween(120)))
-                                },
-                                label = "am_play_pause_icon",
-                            ) { playing ->
-                                Icon(
-                                    imageVector = if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                                    contentDescription = if (playing) "Pause" else "Play",
-                                    tint = inkPrimary,
-                                    modifier = Modifier.size(56.dp),
-                                )
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                AnimatedContent(
+                                    targetState = when {
+                                        playbackState.isPlaying -> "pause"
+                                        playbackState.isBuffering -> "buffering"
+                                        else -> "play"
+                                    },
+                                    transitionSpec = {
+                                        (scaleIn(initialScale = 0.78f, animationSpec = tween(160)) + fadeIn(tween(140)))
+                                            .togetherWith(scaleOut(targetScale = 0.78f, animationSpec = tween(120)) + fadeOut(tween(120)))
+                                    },
+                                    label = "am_play_pause_icon",
+                                ) { mode ->
+                                    when (mode) {
+                                        "buffering" -> CircularProgressIndicator(
+                                            color = inkPrimary,
+                                            strokeWidth = 3.dp,
+                                            modifier = Modifier.size(34.dp),
+                                        )
+                                        "pause" -> Icon(
+                                            imageVector = Icons.Rounded.Pause,
+                                            contentDescription = "Pause",
+                                            tint = inkPrimary,
+                                            modifier = Modifier.size(46.dp),
+                                        )
+                                        else -> Icon(
+                                            imageVector = Icons.Rounded.PlayArrow,
+                                            contentDescription = "Play",
+                                            tint = inkPrimary,
+                                            modifier = Modifier.size(46.dp),
+                                        )
+                                    }
+                                }
                             }
                         }
 
@@ -726,13 +1075,18 @@ fun NowPlayingScreen(
                                     letterSpacing = 1.1.sp,
                                     color = glowPrimary.copy(alpha = 0.95f),
                                 )
+                                val queueLabel = if (autoplayEnabled && playbackState.repeatMode == RepeatModeState.OFF) {
+                                    "Track ${playbackState.currentIndex + 1}/${playbackState.queue.size}+ (∞ Autoplay)"
+                                } else {
+                                    "Track ${playbackState.currentIndex + 1}/${playbackState.queue.size}"
+                                }
                                 Text(
-                                    "Route: ${playbackState.routeLabel} · Track ${playbackState.currentIndex + 1}/${playbackState.queue.size}",
+                                    "Route: ${playbackState.routeLabel} · $queueLabel",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = inkPrimary,
                                 )
                                 Text(
-                                    "Original byte stream · $trackFormat",
+                                    "Stream: $trackFormat · Decoder: ${playbackState.actualAudioFormat.ifBlank { "resolving…" }}",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = inkSecondary,
                                 )
@@ -740,84 +1094,197 @@ fun NowPlayingScreen(
                         }
                     }
 
-                    // Bottom Apple Music utility row (Shuffle · Speed · Repeat · Up Next Queue)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 2.dp),
-                        horizontalArrangement = Arrangement.SpaceEvenly,
-                        verticalAlignment = Alignment.CenterVertically,
+                    // Bottom utility dock inside a subtle frosted sub-capsule
+                    Surface(
+                        color = Color.White.copy(alpha = 0.08f),
+                        shape = RoundedCornerShape(20.dp),
+                        border = BorderStroke(0.6.dp, Color.White.copy(alpha = 0.16f)),
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
-                        AppleUtilityIconButton(
-                            active = playbackState.shuffleEnabled,
-                            onClick = { audioController.toggleShuffle() },
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 2.dp),
+                            horizontalArrangement = Arrangement.SpaceEvenly,
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Icon(
-                                Icons.Rounded.Shuffle,
-                                contentDescription = "Shuffle",
-                                tint = if (playbackState.shuffleEnabled) inkPrimary else inkMuted,
-                                modifier = Modifier.size(22.dp),
-                            )
-                        }
+                            AppleUtilityIconButton(
+                                active = playbackState.shuffleEnabled,
+                                onClick = { audioController.toggleShuffle() },
+                            ) {
+                                Icon(
+                                    Icons.Rounded.Shuffle,
+                                    contentDescription = "Shuffle",
+                                    tint = if (playbackState.shuffleEnabled) inkPrimary else inkMuted,
+                                    modifier = Modifier.size(22.dp),
+                                )
+                            }
 
-                        AppleUtilityIconButton(
-                            active = playbackState.repeatMode != RepeatModeState.OFF,
-                            onClick = { audioController.cycleRepeatMode() },
-                        ) {
-                            Icon(
-                                imageVector = if (playbackState.repeatMode == RepeatModeState.ONE) {
-                                    Icons.Rounded.RepeatOne
-                                } else {
-                                    Icons.Rounded.Repeat
-                                },
-                                contentDescription = "Repeat",
-                                tint = if (playbackState.repeatMode != RepeatModeState.OFF) inkPrimary else inkMuted,
-                                modifier = Modifier.size(22.dp),
-                            )
-                        }
+                            AppleUtilityIconButton(
+                                active = playbackState.repeatMode != RepeatModeState.OFF,
+                                onClick = { audioController.cycleRepeatMode() },
+                            ) {
+                                Icon(
+                                    imageVector = if (playbackState.repeatMode == RepeatModeState.ONE) {
+                                        Icons.Rounded.RepeatOne
+                                    } else {
+                                        Icons.Rounded.Repeat
+                                    },
+                                    contentDescription = "Repeat",
+                                    tint = if (playbackState.repeatMode != RepeatModeState.OFF) inkPrimary else inkMuted,
+                                    modifier = Modifier.size(22.dp),
+                                )
+                            }
 
-                        AppleUtilityIconButton(
-                            active = showQueueSheet,
-                            onClick = { showQueueSheet = true },
+                            AppleUtilityIconButton(
+                                active = showQueueSheet,
+                                onClick = { showQueueSheet = true },
+                            ) {
+                                Icon(
+                                    Icons.AutoMirrored.Rounded.QueueMusic,
+                                    contentDescription = "Up next queue",
+                                    tint = if (showQueueSheet) inkPrimary else inkSecondary,
+                                    modifier = Modifier.size(23.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+                }
+            }
+        }
+        }
+    }
+
+    if (showQueueSheet) {
+        val firstAutoplayIdx = remember(playbackState.queue) {
+            playbackState.queue.indexOfFirst { it.isAutoplayRecommendation }
+        }
+        ModalBottomSheet(
+            onDismissRequest = { showQueueSheet = false },
+            containerColor = baseColor.copy(alpha = 0.88f),
+            contentColor = Color.White,
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = if (autoplayEnabled && playbackState.repeatMode == RepeatModeState.OFF) {
+                            "Playing Next · ∞"
+                        } else {
+                            "Playing Next (${playbackState.queue.size})"
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                    )
+                    if (autoplayEnabled && playbackState.repeatMode == RepeatModeState.OFF) {
+                        Surface(
+                            color = glowPrimary.copy(alpha = 0.25f),
+                            shape = RoundedCornerShape(99.dp),
                         ) {
-                            Icon(
-                                Icons.AutoMirrored.Rounded.QueueMusic,
-                                contentDescription = "Up next queue",
-                                tint = if (showQueueSheet) inkPrimary else inkSecondary,
-                                modifier = Modifier.size(23.dp),
+                            Text(
+                                text = "${playbackState.queue.size}+ loaded",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
                             )
                         }
                     }
                 }
             }
-        }
-    }
 
-    if (showQueueSheet) {
-        ModalBottomSheet(
-            onDismissRequest = { showQueueSheet = false },
-            containerColor = baseColor.copy(alpha = 0.97f),
-            contentColor = Color.White,
-        ) {
-            Text(
-                "Playing Next (${playbackState.queue.size})",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = Color.White,
-                modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
-            )
+            // Spotify-style Autoplay toggle banner inside Playing Next
+            Surface(
+                color = Color.White.copy(alpha = 0.08f),
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(
+                    width = 0.5.dp,
+                    color = if (autoplayEnabled) glowPrimary.copy(alpha = 0.55f) else Color.White.copy(alpha = 0.14f),
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 6.dp),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.AllInclusive,
+                        contentDescription = null,
+                        tint = if (autoplayEnabled) glowPrimary else Color.White.copy(alpha = 0.6f),
+                        modifier = Modifier.size(22.dp),
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Autoplay Similar Songs",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                        )
+                        Text(
+                            text = if (autoplayEnabled) {
+                                "Plays suggested songs infinitely after your playlist finishes"
+                            } else {
+                                "Playback stops when this playlist finishes"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color.White.copy(alpha = 0.68f),
+                        )
+                    }
+                    Switch(
+                        checked = autoplayEnabled,
+                        onCheckedChange = onToggleAutoplay,
+                        modifier = Modifier.testTag("now_playing_autoplay_switch"),
+                    )
+                }
+            }
+
             LazyColumn(
-                contentPadding = PaddingValues(16.dp),
+                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 itemsIndexed(playbackState.queue) { idx, item ->
+                    if (idx == firstAutoplayIdx) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 8.dp, bottom = 4.dp, start = 4.dp, end = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.AutoAwesome,
+                                contentDescription = null,
+                                tint = glowPrimary,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Text(
+                                text = "Suggested for you · Autoplay ∞",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = Color.White.copy(alpha = 0.88f),
+                            )
+                        }
+                    }
                     val isCurrent = idx == playbackState.currentIndex
                     Surface(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(14.dp))
                             .clickable {
-                                audioController.playQueue(playbackState.queue, idx)
+                                audioController.jumpToQueueIndex(idx)
                                 showQueueSheet = false
                             },
                         color = if (isCurrent) glowPrimary.copy(alpha = 0.24f) else Color.White.copy(alpha = 0.08f),
@@ -833,14 +1300,95 @@ fun NowPlayingScreen(
                                 contentDescription = null,
                                 tint = if (isCurrent) glowPrimary else Color.White.copy(alpha = 0.65f),
                             )
-                            Text(
-                                item.name.substringBeforeLast('.').replace('_', ' '),
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
-                                color = Color.White,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    item.displayTitle,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
+                                    color = Color.White,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                if (!item.artist.isNullOrBlank()) {
+                                    Text(
+                                        item.artist,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color.White.copy(alpha = 0.65f),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                            if (item.isAutoplayRecommendation) {
+                                Surface(
+                                    color = Color.White.copy(alpha = 0.12f),
+                                    shape = RoundedCornerShape(8.dp),
+                                ) {
+                                    Text(
+                                        text = "Suggested",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color.White.copy(alpha = 0.78f),
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (autoplayEnabled) {
+                    item {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 8.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            if (playbackState.isLoadingRecommendations) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    modifier = Modifier.padding(vertical = 8.dp),
+                                ) {
+                                    CircularProgressIndicator(
+                                        color = glowPrimary,
+                                        strokeWidth = 2.dp,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                    Text(
+                                        text = "Finding more similar songs…",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = Color.White.copy(alpha = 0.78f),
+                                    )
+                                }
+                            } else {
+                                Surface(
+                                    onClick = onLoadMoreSuggestions,
+                                    shape = RoundedCornerShape(99.dp),
+                                    color = Color.White.copy(alpha = 0.14f),
+                                    border = BorderStroke(0.5.dp, Color.White.copy(alpha = 0.25f)),
+                                    modifier = Modifier.testTag("now_playing_load_more_btn"),
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.AutoAwesome,
+                                            contentDescription = null,
+                                            tint = Color.White,
+                                            modifier = Modifier.size(16.dp),
+                                        )
+                                        Text(
+                                            text = "Load more suggestions ∞",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.White,
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -927,7 +1475,7 @@ private fun AppleMusicScrubber(
     isScrubbing: Boolean,
     badgeLabel: String,
     onScrub: (Long) -> Unit,
-    onScrubEnd: () -> Unit,
+    onScrubEnd: (Long) -> Unit,
 ) {
     val safeDuration = durationMs.coerceAtLeast(1L)
     val rawFraction = (positionMs.toFloat() / safeDuration.toFloat()).coerceIn(0f, 1f)
@@ -945,22 +1493,30 @@ private fun AppleMusicScrubber(
                 .fillMaxWidth()
                 .height(34.dp)
                 .onSizeChanged { barWidthPx = it.width.toFloat().coerceAtLeast(1f) }
-                .pointerInput(durationMs) {
+                .pointerInput(safeDuration) {
                     detectTapGestures { offset ->
                         val frac = (offset.x / barWidthPx).coerceIn(0f, 1f)
-                        onScrub((frac * safeDuration).toLong())
-                        onScrubEnd()
+                        val targetMs = (frac * safeDuration).toLong()
+                        onScrub(targetMs)
+                        onScrubEnd(targetMs)
                     }
                 }
-                .pointerInput(durationMs) {
+                .pointerInput(safeDuration) {
+                    var dragTargetMs = positionMs
                     detectHorizontalDragGestures(
+                        onDragStart = { offset ->
+                            val frac = (offset.x / barWidthPx).coerceIn(0f, 1f)
+                            dragTargetMs = (frac * safeDuration).toLong()
+                            onScrub(dragTargetMs)
+                        },
                         onHorizontalDrag = { change, _ ->
                             change.consume()
                             val frac = (change.position.x / barWidthPx).coerceIn(0f, 1f)
-                            onScrub((frac * safeDuration).toLong())
+                            dragTargetMs = (frac * safeDuration).toLong()
+                            onScrub(dragTargetMs)
                         },
-                        onDragEnd = { onScrubEnd() },
-                        onDragCancel = { onScrubEnd() },
+                        onDragEnd = { onScrubEnd(dragTargetMs) },
+                        onDragCancel = { onScrubEnd(dragTargetMs) },
                     )
                 },
             contentAlignment = Alignment.CenterStart,

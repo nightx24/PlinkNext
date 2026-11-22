@@ -25,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.Headphones
+import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -76,6 +77,8 @@ fun MediaBrowserScreen(
     api: PocketLinkApi,
     imageLoader: ImageLoader,
     category: MediaCategory,
+    showYtMusic: Boolean = false,
+    onOpenYtMusic: () -> Unit = {},
     onPlayAudio: (tracks: List<IndexedFile>, index: Int) -> Unit,
     onPlayVideo: (video: IndexedFile) -> Unit,
     onBack: () -> Unit,
@@ -176,6 +179,39 @@ fun MediaBrowserScreen(
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 6.dp),
             )
+
+            if (isMusic && showYtMusic) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 4.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .clickable(onClick = onOpenYtMusic),
+                    color = VioletAccent.copy(alpha = 0.14f),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Icon(Icons.Rounded.LibraryMusic, contentDescription = null, tint = VioletAccent)
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Open Discover",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Text(
+                                text = "Stream via NewPipe · charts, radio & synced lyrics",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Icon(Icons.Rounded.PlayArrow, contentDescription = "Open Discover", tint = VioletAccent)
+                    }
+                }
+            }
 
             if (isMusic && displayed.isNotEmpty() && (!folderMode || selectedFolder != null)) {
                 Row(

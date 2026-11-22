@@ -19,3 +19,13 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# NewPipeExtractor / Rhino JS deobfuscator
+-keep class org.mozilla.javascript.** { *; }
+-keep class org.mozilla.classfile.ClassFileWriter
+-dontwarn org.mozilla.javascript.tools.**
+-dontwarn org.schabi.newpipe.extractor.**
+
+# Preserve Media3 AndroidAutoConnectionStateObserver class name for safe provider check
+-keepnames class androidx.media3.session.AndroidAutoConnectionStateObserver
+

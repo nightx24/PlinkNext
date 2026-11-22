@@ -84,6 +84,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.ui.PocketLinkViewModel
 import com.example.ui.components.PocketLinkTopBar
 import com.example.ui.theme.IndigoPrimary
@@ -103,6 +104,8 @@ fun LocalStorageSetupScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
+    val tunnelStatus by viewModel.tunnelStatus.collectAsStateWithLifecycle()
+    val tunnelConfig by viewModel.tunnelConfig.collectAsStateWithLifecycle()
 
     var passwordInput by remember { mutableStateOf("") }
     var obscurePassword by remember { mutableStateOf(true) }
@@ -241,6 +244,16 @@ fun LocalStorageSetupScreen(
                             scope.launch { snackbarHostState.showSnackbar("Copied $addr") }
                         },
                         onConnectLocal = onConnectLocal,
+                    )
+                }
+
+                item {
+                    CloudflareTunnelCard(
+                        viewModel = viewModel,
+                        tunnelStatus = tunnelStatus,
+                        tunnelConfig = tunnelConfig,
+                        hostRunning = hostStatus.running,
+                        onMessage = { msg -> scope.launch { snackbarHostState.showSnackbar(msg) } },
                     )
                 }
 

@@ -1,329 +1,825 @@
 package io.github.augztn.pocketlink.ssdbridge
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.app.PendingIntent
-import android.app.Service
-import android.content.ComponentName
+import android.content.ContentProvider
+import android.content.ContentResolver
+import android.content.ContentValues
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
-import android.media.AudioManager
+import android.content.pm.PackageManager
+import android.content.pm.ProviderInfo
+import android.database.Cursor
+import android.net.Uri
 import android.os.Build
-import android.os.IBinder
-import androidx.core.app.NotificationCompat
-import androidx.media.app.NotificationCompat.MediaStyle
-import androidx.media.session.MediaButtonReceiver
-import android.support.v4.media.MediaMetadataCompat
-import android.support.v4.media.session.MediaSessionCompat
-import android.support.v4.media.session.PlaybackStateCompat
+import android.os.Bundle
+import android.os.CancellationSignal
+import android.os.Handler
+import android.os.Looper
+import androidx.annotation.OptIn
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.HttpDataSource
+import androidx.media3.datasource.ResolvingDataSource
+import androidx.media3.datasource.TransferListener
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.extractor.DefaultExtractorsFactory
+import androidx.media3.session.MediaSession
+import androidx.media3.session.MediaSessionService
+import com.example.data.store.AppLogger
+import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import java.io.IOException
+import java.io.InputStream
+import java.util.concurrent.TimeUnit
 
 /**
- * Android media-session adapter exposing transport controls
- * to Android System UI, Bluetooth headsets and the lock screen.
+ * Shared ExoPlayer factory tuning audio sink, async MediaCodec queueing,
+ * constant-bitrate seekability, and streaming load control for both
+ * background audio playback and the video player.
  */
-class MediaPlaybackService : Service() {
-    private var session: MediaSessionCompat? = null
-    private var title: String = "PocketLink"
-    private var artist: String = "Personal music library"
-    private var playing = false
-    private var positionMs = 0L
-    private var durationMs = 0L
-    private var audioFocusRequest: AudioFocusRequest? = null
-    private var resumeAfterFocus = false
-    private var hasAudioFocus = false
-    private val audioManager by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
-    private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { change ->
-        when (change) {
-            AudioManager.AUDIOFOCUS_GAIN -> {
-                hasAudioFocus = true
-                if (resumeAfterFocus) {
-                    resumeAfterFocus = false
-                    playing = true
-                    MediaPlaybackBridge.commandHandler?.invoke(ACTION_PLAY, null)
-                    updateSessionAndNotification()
+object PocketLinkMediaEngine {
+    @OptIn(UnstableApi::class)
+    fun buildExoPlayer(
+        context: Context,
+        dataSourceFactory: DataSource.Factory,
+        contentType: Int,
+        handleWakeMode: Boolean = false,
+    ): ExoPlayer {
+        val extractorsFactory = DefaultExtractorsFactory()
+            .setConstantBitrateSeekingEnabled(true)
+        val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory)
+        val renderersFactory = object : DefaultRenderersFactory(context) {
+            override fun buildAudioSink(
+                context: Context,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean,
+            ): AudioSink = DefaultAudioSink.Builder(context)
+                .setEnableFloatOutput(enableFloatOutput)
+                .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                .build()
+        }
+            .setEnableAudioFloatOutput(false)
+            .setEnableAudioTrackPlaybackParams(true)
+            .forceEnableMediaCodecAsynchronousQueueing()
+
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                /* minBufferMs = */ 15_000,
+                /* maxBufferMs = */ 50_000,
+                /* bufferForPlaybackMs = */ 1_200,
+                /* bufferForPlaybackAfterRebufferMs = */ 2_500,
+            )
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(contentType)
+            .build()
+
+        return ExoPlayer.Builder(context, renderersFactory)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .setLoadControl(loadControl)
+            .setAudioAttributes(audioAttributes, /* handleAudioFocus = */ true)
+            .setHandleAudioBecomingNoisy(true)
+            .apply {
+                if (handleWakeMode) {
+                    setWakeMode(C.WAKE_MODE_NETWORK)
                 }
             }
-            // Notification sounds and other short, duckable sounds should not
-            // pause music. Android may briefly lower media volume automatically.
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> Unit
-            // Calls and other non-duckable interruptions still pause playback.
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                hasAudioFocus = false
-                resumeAfterFocus = playing
-                pauseForFocusLoss()
+            .build()
+    }
+}
+
+/**
+ * Media3 MediaSessionService hosting audio ExoPlayer in the foreground/background,
+ * exposing system media notifications, lock screen transport controls, and headset
+ * media button events cleanly with single-owner AudioFocus.
+ */
+@OptIn(UnstableApi::class)
+class MediaPlaybackService : MediaSessionService() {
+    private var exoPlayer: ExoPlayer? = null
+    private var mediaSession: MediaSession? = null
+
+    private val playerListener = object : Player.Listener {
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            MediaPlaybackBridge.isPlaying = isPlaying
+        }
+
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            if (playbackState == Player.STATE_IDLE || playbackState == Player.STATE_ENDED) {
+                MediaPlaybackBridge.isPlaying = false
             }
-            AudioManager.AUDIOFOCUS_LOSS -> {
-                hasAudioFocus = false
-                resumeAfterFocus = false
-                pauseForFocusLoss()
+        }
+
+        override fun onPlayerError(error: PlaybackException) {
+            val hlsSwitch = generateSequence<Throwable>(error) { it.cause }
+                .filterIsInstance<HlsSwitchException>()
+                .firstOrNull()
+            if (hlsSwitch != null) {
+                val player = exoPlayer
+                if (player != null) {
+                    val idx = player.currentMediaItemIndex
+                    val pos = player.currentPosition.coerceAtLeast(0L)
+                    if (idx in 0 until player.mediaItemCount) {
+                        val currentItem = player.getMediaItemAt(idx)
+                        val hlsItem = currentItem.buildUpon()
+                            .setUri(Uri.parse(hlsSwitch.stream.url))
+                            .setMimeType(MimeTypes.APPLICATION_M3U8)
+                            .build()
+                        AppLogger.info(
+                            "Switching Discover track to HLS",
+                            "${hlsSwitch.videoId} via ${hlsSwitch.stream.sourceName} @ ${pos}ms"
+                        )
+                        player.replaceMediaItem(idx, hlsItem)
+                        player.seekTo(idx, pos)
+                        player.prepare()
+                        player.play()
+                        return
+                    }
+                }
             }
+            MediaPlaybackBridge.isPlaying = false
         }
     }
 
     override fun onCreate() {
         super.onCreate()
-        createChannel()
-        val mediaButtonComponent = ComponentName(this, MediaButtonReceiver::class.java)
-        val mediaButtonIntent = Intent(Intent.ACTION_MEDIA_BUTTON).setComponent(mediaButtonComponent)
-        val mediaButtonPendingIntent = PendingIntent.getBroadcast(
-            this,
-            0,
-            mediaButtonIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        session = MediaSessionCompat(
-            this,
-            "PocketLinkMedia",
-            mediaButtonComponent,
-            mediaButtonPendingIntent,
-        ).apply {
-            setCallback(object : MediaSessionCompat.Callback() {
-                override fun onPlay() = dispatch(ACTION_PLAY)
-                override fun onPause() = dispatch(ACTION_PAUSE)
-                override fun onSkipToNext() = dispatch(ACTION_NEXT)
-                override fun onSkipToPrevious() = dispatch(ACTION_PREVIOUS)
-                override fun onSeekTo(pos: Long) {
-                    MediaPlaybackBridge.commandHandler?.invoke(ACTION_SEEK, pos)
-                }
-                override fun onStop() = dispatch(ACTION_STOP)
-            })
-            isActive = true
-        }
-    }
+        MediaPlaybackBridge.isServiceRunning = true
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == Intent.ACTION_MEDIA_BUTTON) {
-            MediaButtonReceiver.handleIntent(session, intent)
-            return START_NOT_STICKY
+        val player = PocketLinkMediaEngine.buildExoPlayer(
+            context = this,
+            dataSourceFactory = MediaPlaybackBridge.dynamicDataSourceFactory(this),
+            contentType = C.AUDIO_CONTENT_TYPE_MUSIC,
+            handleWakeMode = true,
+        ).also { created ->
+            created.skipSilenceEnabled = MediaPlaybackBridge.skipSilenceEnabled
+            created.addListener(playerListener)
         }
-        when (intent?.action) {
-            ACTION_PLAY, LEGACY_ACTION_PLAY -> {
-                dispatch(ACTION_PLAY)
-                return START_NOT_STICKY
-            }
-            ACTION_PAUSE, LEGACY_ACTION_PAUSE -> {
-                dispatch(ACTION_PAUSE)
-                return START_NOT_STICKY
-            }
-            ACTION_NEXT, LEGACY_ACTION_NEXT -> {
-                dispatch(ACTION_NEXT)
-                return START_NOT_STICKY
-            }
-            ACTION_PREVIOUS, LEGACY_ACTION_PREVIOUS -> {
-                dispatch(ACTION_PREVIOUS)
-                return START_NOT_STICKY
-            }
-            ACTION_STOP, LEGACY_ACTION_STOP -> {
-                dispatch(ACTION_STOP)
-                return START_NOT_STICKY
-            }
-            ACTION_DISMISS, LEGACY_ACTION_DISMISS -> {
-                stopForegroundCompat()
-                stopSelf()
-                return START_NOT_STICKY
-            }
+        exoPlayer = player
+        MediaPlaybackBridge.skipSilenceListener = { enabled ->
+            player.skipSilenceEnabled = enabled
         }
-        intent?.let {
-            title = it.getStringExtra(EXTRA_TITLE) ?: title
-            artist = it.getStringExtra(EXTRA_ARTIST) ?: artist
-            playing = it.getBooleanExtra(EXTRA_PLAYING, playing)
-            positionMs = it.getLongExtra(EXTRA_POSITION, positionMs).coerceAtLeast(0)
-            durationMs = it.getLongExtra(EXTRA_DURATION, durationMs).coerceAtLeast(0)
-        }
-        if (playing && !requestAudioFocus()) {
-            playing = false
-            MediaPlaybackBridge.commandHandler?.invoke(ACTION_PAUSE, null)
-        } else if (!playing && !resumeAfterFocus) {
-            abandonAudioFocus()
-        }
-        updateSession()
-        startForeground(NOTIFICATION_ID, buildNotification())
-        return START_NOT_STICKY
-    }
 
-    private fun dispatch(action: String) {
-        when (action) {
-            ACTION_PLAY -> {
-                if (!requestAudioFocus()) return
-                playing = true
-            }
-            ACTION_PAUSE, ACTION_STOP -> {
-                playing = false
-                resumeAfterFocus = false
-                abandonAudioFocus()
-            }
-        }
-        MediaPlaybackBridge.commandHandler?.invoke(action, null)
-        updateSessionAndNotification()
-    }
-
-    private fun requestAudioFocus(): Boolean {
-        if (hasAudioFocus) return true
-        val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val request = audioFocusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build()
-                )
-                .setOnAudioFocusChangeListener(audioFocusListener)
-                .build()
-                .also { audioFocusRequest = it }
-            audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager.requestAudioFocus(
-                audioFocusListener,
-                AudioManager.STREAM_MUSIC,
-                AudioManager.AUDIOFOCUS_GAIN
-            ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        }
-        hasAudioFocus = granted
-        return granted
-    }
-
-    private fun abandonAudioFocus() {
-        hasAudioFocus = false
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager.abandonAudioFocus(audioFocusListener)
-        }
-    }
-
-    private fun pauseForFocusLoss() {
-        if (playing) {
-            playing = false
-            MediaPlaybackBridge.commandHandler?.invoke(ACTION_PAUSE, null)
-            updateSessionAndNotification()
-        }
-    }
-
-    private fun updateSessionAndNotification() {
-        updateSession()
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, buildNotification())
-    }
-
-    private fun updateSession() {
-        MediaPlaybackBridge.isPlaying = playing
-        val activeSession = session ?: return
-        activeSession.setMetadata(
-            MediaMetadataCompat.Builder()
-                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
-                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist)
-                .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, durationMs)
-                .build()
-        )
-        val actions = PlaybackStateCompat.ACTION_PLAY or PlaybackStateCompat.ACTION_PAUSE or
-            PlaybackStateCompat.ACTION_PLAY_PAUSE or PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
-            PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or PlaybackStateCompat.ACTION_SEEK_TO or
-            PlaybackStateCompat.ACTION_STOP
-        activeSession.setPlaybackState(
-            PlaybackStateCompat.Builder()
-                .setActions(actions)
-                .setState(
-                    if (playing) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED,
-                    positionMs,
-                    if (playing) 1f else 0f
-                )
-                .build()
-        )
-    }
-
-    private fun buildNotification(): Notification {
-        val playPauseAction = if (playing) ACTION_PAUSE else ACTION_PLAY
-        val playPauseIcon = if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
             addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         }
-        val contentIntent = launchIntent?.let {
+        val sessionActivity = launchIntent?.let {
             PendingIntent.getActivity(
-                this, 0, it,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                this,
+                0,
+                it,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
         }
-        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(artist)
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setContentIntent(contentIntent)
-            .setOnlyAlertOnce(true)
-            .setOngoing(playing)
-            .addAction(android.R.drawable.ic_media_previous, "Previous", actionIntent(ACTION_PREVIOUS, 1))
-            .addAction(playPauseIcon, if (playing) "Pause" else "Play", actionIntent(playPauseAction, 2))
-            .addAction(android.R.drawable.ic_media_next, "Next", actionIntent(ACTION_NEXT, 3))
-            .setDeleteIntent(actionIntent(ACTION_DISMISS, 4))
-            .setStyle(
-                MediaStyle()
-                    .setMediaSession(session?.sessionToken)
-                    .setShowActionsInCompactView(0, 1, 2)
-            )
-        return builder.build()
-    }
 
-    private fun actionIntent(action: String, requestCode: Int): PendingIntent {
-        val intent = Intent(this, MediaPlaybackService::class.java).setAction(action)
-        return PendingIntent.getService(
-            this, requestCode, intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-    }
-
-    private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.deleteNotificationChannel("homeserver-music")
-            manager.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Music playback", NotificationManager.IMPORTANCE_LOW)
-            )
+        val builder = MediaSession.Builder(CarConnectionSafeContextWrapper(this), player)
+        if (sessionActivity != null) {
+            builder.setSessionActivity(sessionActivity)
         }
+        mediaSession = builder.build()
+    }
+
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (!isPlaybackOngoing) {
+            pauseAllPlayersAndStopSelf()
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
+        MediaPlaybackBridge.isServiceRunning = false
         MediaPlaybackBridge.isPlaying = false
-        abandonAudioFocus()
-        resumeAfterFocus = false
-        session?.isActive = false
-        session?.release()
-        session = null
+        MediaPlaybackBridge.skipSilenceListener = null
+        mediaSession?.run {
+            player.removeListener(playerListener)
+            player.release()
+            release()
+        }
+        mediaSession = null
+        exoPlayer = null
         super.onDestroy()
     }
+}
 
-    override fun onBind(intent: Intent?): IBinder? = null
+/**
+ * Prevents Media3's AndroidAutoConnectionStateObserver (API 33+) from querying the
+ * `content://androidx.car.app.connection` provider when Android Auto is not installed,
+ * which otherwise triggers `E/ActivityThread: Failed to find provider info for androidx.car.app.connection`.
+ * When the provider is present, or for any other ContentResolver caller, delegates directly to the system resolver.
+ */
+private class CarConnectionSafeContextWrapper(
+    base: Context,
+) : ContextWrapper(base.applicationContext) {
+
+    private val emptyCarConnectionResolver: ContentResolver? by lazy {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return@lazy null
+        runCatching {
+            val provider = EmptyCarConnectionProvider()
+            val info = ProviderInfo().apply {
+                authority = CAR_CONNECTION_AUTHORITY
+                packageName = baseContext.packageName
+                name = EmptyCarConnectionProvider::class.java.name
+                applicationInfo = baseContext.applicationInfo
+                exported = true
+            }
+            provider.attachInfo(baseContext, info)
+            ContentResolver.wrap(provider)
+        }.getOrNull()
+    }
+
+    override fun getApplicationContext(): Context = this
+
+    override fun getContentResolver(): ContentResolver {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            isCarConnectionObserverCall() &&
+            !hasCarConnectionProvider()
+        ) {
+            emptyCarConnectionResolver?.let { return it }
+        }
+        return super.getContentResolver()
+    }
+
+    private fun hasCarConnectionProvider(): Boolean = runCatching {
+        val providerInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            packageManager.resolveContentProvider(
+                CAR_CONNECTION_AUTHORITY,
+                PackageManager.ComponentInfoFlags.of(0L),
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            packageManager.resolveContentProvider(CAR_CONNECTION_AUTHORITY, 0)
+        }
+        providerInfo != null
+    }.getOrDefault(false)
+
+    private fun isCarConnectionObserverCall(): Boolean {
+        val frames = Thread.currentThread().stackTrace
+        for (i in 2 until frames.size) {
+            if (frames[i].className == CAR_CONNECTION_OBSERVER_CLASS) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private class EmptyCarConnectionProvider : ContentProvider() {
+        override fun onCreate(): Boolean = true
+
+        override fun query(
+            uri: Uri,
+            projection: Array<out String>?,
+            selection: String?,
+            selectionArgs: Array<out String>?,
+            sortOrder: String?,
+        ): Cursor? = null
+
+        override fun query(
+            uri: Uri,
+            projection: Array<out String>?,
+            queryArgs: Bundle?,
+            cancellationSignal: CancellationSignal?,
+        ): Cursor? = null
+
+        override fun getType(uri: Uri): String? = null
+        override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+        override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+        override fun update(
+            uri: Uri,
+            values: ContentValues?,
+            selection: String?,
+            selectionArgs: Array<out String>?,
+        ): Int = 0
+    }
 
     companion object {
-        const val ACTION_UPDATE = "io.github.augztn.pocketlink.media.UPDATE"
-        const val ACTION_PLAY = "io.github.augztn.pocketlink.media.PLAY"
-        const val ACTION_PAUSE = "io.github.augztn.pocketlink.media.PAUSE"
-        const val ACTION_NEXT = "io.github.augztn.pocketlink.media.NEXT"
-        const val ACTION_PREVIOUS = "io.github.augztn.pocketlink.media.PREVIOUS"
-        const val ACTION_SEEK = "io.github.augztn.pocketlink.media.SEEK"
-        const val ACTION_STOP = "io.github.augztn.pocketlink.media.STOP"
-        const val ACTION_DISMISS = "io.github.augztn.pocketlink.media.DISMISS"
-        private const val LEGACY_ACTION_PLAY = "dev.homeserver.media.PLAY"
-        private const val LEGACY_ACTION_PAUSE = "dev.homeserver.media.PAUSE"
-        private const val LEGACY_ACTION_NEXT = "dev.homeserver.media.NEXT"
-        private const val LEGACY_ACTION_PREVIOUS = "dev.homeserver.media.PREVIOUS"
-        private const val LEGACY_ACTION_STOP = "dev.homeserver.media.STOP"
-        private const val LEGACY_ACTION_DISMISS = "dev.homeserver.media.DISMISS"
-        const val EXTRA_TITLE = "title"
-        const val EXTRA_ARTIST = "artist"
-        const val EXTRA_PLAYING = "playing"
-        const val EXTRA_POSITION = "position"
-        const val EXTRA_DURATION = "duration"
-        private const val CHANNEL_ID = "pocketlink-music"
-        private const val NOTIFICATION_ID = 8766
+        private const val CAR_CONNECTION_AUTHORITY = "androidx.car.app.connection"
+        private const val CAR_CONNECTION_OBSERVER_CLASS =
+            "androidx.media3.session.AndroidAutoConnectionStateObserver"
+    }
+}
+
+internal data class ResolvedExternalStream(
+    val url: String,
+    val userAgent: String,
+    val headers: Map<String, String> = emptyMap(),
+    val badgeLabel: String = "",
+    val sourceName: String = "NewPipe",
+    val useQueryRange: Boolean = false,
+    val isHls: Boolean = false,
+)
+
+internal class HlsSwitchException(
+    val videoId: String,
+    val stream: ResolvedExternalStream,
+) : IOException("HLS_HANDOFF:$videoId")
+
+/**
+ * BitChord / InnerTune / NewPipe-style bounded-range chunked HTTP DataSource for googlevideo.com.
+ *
+ * Executes direct OkHttp bounded `Range: bytes=start-end` requests (512 KB chunks) with a single
+ * clean `User-Agent` header (identical to `YtMusicClient.probeStreamUrl`), avoiding both:
+ * 1) Media3 `OkHttpDataSource` duplicating `User-Agent` when present in both factory & DataSpec.
+ * 2) `googlevideo.com` returning HTTP 403 on unbounded full-file GET requests for Opus streams.
+ */
+@OptIn(UnstableApi::class)
+internal class ChunkedYoutubeDataSource(
+    private val client: OkHttpClient,
+    private val userAgent: String?,
+    private val initialUseQueryRange: Boolean = false,
+) : DataSource {
+    private val listeners = mutableListOf<TransferListener>()
+    private var baseDataSpec: DataSpec? = null
+    private var resolvedBaseUrl: String? = null
+    private var activeResponse: Response? = null
+    private var activeStream: InputStream? = null
+    private var activeUri: Uri? = null
+    private var opened: Boolean = false
+    private var currentPos: Long = 0L
+    private var totalLength: Long = C.LENGTH_UNSET.toLong()
+    private var requestedEndExclusive: Long = C.LENGTH_UNSET.toLong()
+    private var lastResponseHeaders: Map<String, List<String>> = emptyMap()
+    private var preferQueryRange: Boolean = initialUseQueryRange
+    private var chunkRequestSeq: Int = 0
+
+    override fun addTransferListener(transferListener: TransferListener) {
+        if (transferListener !in listeners) {
+            listeners.add(transferListener)
+        }
+    }
+
+    override fun open(dataSpec: DataSpec): Long {
+        closeCurrentChunk()
+        baseDataSpec = dataSpec
+        resolvedBaseUrl = stripRangeQueryParams(dataSpec.uri.toString())
+        activeUri = dataSpec.uri
+        currentPos = dataSpec.position.coerceAtLeast(0L)
+        preferQueryRange = initialUseQueryRange
+        chunkRequestSeq = 0
+        // Extract authoritative total byte length from YouTube's `clen=` query param when present
+        totalLength = extractClenFromUrl(dataSpec.uri.toString()) ?: C.LENGTH_UNSET.toLong()
+        requestedEndExclusive = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
+            currentPos + dataSpec.length
+        } else {
+            C.LENGTH_UNSET.toLong()
+        }
+
+        listeners.forEach { it.onTransferInitializing(this, dataSpec, /* isNetwork = */ true) }
+        openNextChunk(isInitialChunk = true)
+        opened = true
+        listeners.forEach { it.onTransferStart(this, dataSpec, /* isNetwork = */ true) }
+
+        return when {
+            dataSpec.length != C.LENGTH_UNSET.toLong() -> dataSpec.length
+            totalLength != C.LENGTH_UNSET.toLong() -> (totalLength - currentPos).coerceAtLeast(0L)
+            else -> C.LENGTH_UNSET.toLong()
+        }
+    }
+
+    private fun executeChunkRequest(
+        spec: DataSpec,
+        baseUrl: String,
+        rangeStart: Long,
+        rangeEnd: Long,
+        useQueryParamRange: Boolean,
+    ): Response {
+        val seq = ++chunkRequestSeq
+        val targetUrl = if (useQueryParamRange) {
+            buildQueryRangeUrl(baseUrl, rangeStart, rangeEnd, seq)
+        } else {
+            baseUrl
+        }
+        val reqBuilder = Request.Builder()
+            .url(targetUrl)
+            .get()
+            .header("Accept", "*/*")
+            .header("Accept-Encoding", "identity")
+
+        if (!useQueryParamRange) {
+            reqBuilder.header("Range", "bytes=$rangeStart-$rangeEnd")
+        }
+
+        // Apply extra headers except internal/Range/User-Agent (single authoritative User-Agent below)
+        spec.httpRequestHeaders.forEach { (key, value) ->
+            if (!key.equals("Range", ignoreCase = true) &&
+                !key.equals("User-Agent", ignoreCase = true) &&
+                !key.equals("Accept-Encoding", ignoreCase = true) &&
+                !key.equals(HEADER_USE_QUERY_RANGE, ignoreCase = true) &&
+                value.isNotBlank()
+            ) {
+                reqBuilder.header(key, value)
+            }
+        }
+        val resolvedUa = userAgent?.takeIf { it.isNotBlank() }
+            ?: spec.httpRequestHeaders.entries
+                .firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }
+                ?.value
+                ?.takeIf { it.isNotBlank() }
+        if (resolvedUa != null) {
+            reqBuilder.header("User-Agent", resolvedUa)
+        }
+
+        return try {
+            client.newCall(reqBuilder.build()).execute()
+        } catch (io: IOException) {
+            throw HttpDataSource.HttpDataSourceException.createForIOException(
+                io,
+                spec,
+                HttpDataSource.HttpDataSourceException.TYPE_OPEN,
+            )
+        }
+    }
+
+    private fun openNextChunk(isInitialChunk: Boolean = false): Boolean {
+        closeCurrentChunk()
+        val spec = baseDataSpec ?: return false
+        val baseUrl = resolvedBaseUrl ?: stripRangeQueryParams(spec.uri.toString())
+        if (totalLength != C.LENGTH_UNSET.toLong() && currentPos >= totalLength) return false
+        if (requestedEndExclusive != C.LENGTH_UNSET.toLong() && currentPos >= requestedEndExclusive) return false
+
+        var chunkLen = CHUNK_SIZE_BYTES
+        if (totalLength != C.LENGTH_UNSET.toLong()) {
+            chunkLen = minOf(chunkLen, totalLength - currentPos)
+        }
+        if (requestedEndExclusive != C.LENGTH_UNSET.toLong()) {
+            chunkLen = minOf(chunkLen, requestedEndExclusive - currentPos)
+        }
+        if (chunkLen <= 0L) return false
+
+        val rangeEnd = currentPos + chunkLen - 1L
+        var usedQueryMode = preferQueryRange
+        var response = executeChunkRequest(spec, baseUrl, currentPos, rangeEnd, usedQueryMode)
+
+        // Automatic fallback between YouTube native `&range=` query mode and HTTP `Range:` header
+        // if googlevideo.com rejects one mode with HTTP 403 (common on ANDROID_VR / VPN edge nodes).
+        if (response.code == 403) {
+            response.close()
+            val alternateMode = !usedQueryMode
+            val retryResponse = executeChunkRequest(spec, baseUrl, currentPos, rangeEnd, alternateMode)
+            if (retryResponse.code in 200..299) {
+                preferQueryRange = alternateMode
+                usedQueryMode = alternateMode
+                AppLogger.info(
+                    "Discover switched range transport",
+                    "mode=${if (alternateMode) "query(&range=)" else "header(Range:)"} pos=$currentPos-$rangeEnd"
+                )
+            }
+            response = retryResponse
+        }
+
+        val code = response.code
+        val headersMap = response.headers.toMultimap()
+        lastResponseHeaders = headersMap
+        val finalUrlStr = response.request.url.toString()
+        activeUri = Uri.parse(finalUrlStr)
+
+        // HTTP 416 Range Not Satisfiable on a subsequent chunk means we reached exact EOF
+        if (code == 416 && !isInitialChunk) {
+            response.close()
+            totalLength = currentPos
+            return false
+        }
+
+        if (code !in 200..299) {
+            val host = spec.uri.host.orEmpty()
+            AppLogger.warning(
+                "Chunked Discover HTTP $code",
+                "host=$host mode=${if (usedQueryMode) "query" else "header"} pos=$currentPos-$rangeEnd contentType=${response.header("Content-Type").orEmpty()}"
+            )
+            response.close()
+            throw HttpDataSource.InvalidResponseCodeException(
+                code,
+                response.message,
+                null,
+                headersMap,
+                spec,
+                ByteArray(0),
+            )
+        }
+
+        val body = response.body
+        if (body == null) {
+            response.close()
+            throw HttpDataSource.HttpDataSourceException(
+                "Empty response body from googlevideo",
+                spec,
+                androidx.media3.common.PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
+                HttpDataSource.HttpDataSourceException.TYPE_OPEN,
+            )
+        }
+
+        // Cache redirected googlevideo edge host (without range params) to avoid redirect latency on next chunks
+        resolvedBaseUrl = stripRangeQueryParams(finalUrlStr)
+
+        activeResponse = response
+        activeStream = body.byteStream()
+
+        // Learn total stream length from Content-Range, clen, or short final chunk
+        val contentRange = response.header("Content-Range")
+        val parsedTotal = parseContentRangeTotal(contentRange)
+        val contentLength = body.contentLength()
+        when {
+            parsedTotal != null && parsedTotal > 0L -> totalLength = parsedTotal
+            !usedQueryMode && code == 200 && contentLength > 0L -> totalLength = currentPos + contentLength
+            contentLength in 0L until chunkLen -> totalLength = currentPos + contentLength
+        }
+        return true
+    }
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+        if (length == 0) return 0
+        while (true) {
+            val stream = activeStream ?: return C.RESULT_END_OF_INPUT
+            val read = try {
+                stream.read(buffer, offset, length)
+            } catch (io: IOException) {
+                val spec = baseDataSpec
+                if (spec != null) {
+                    throw HttpDataSource.HttpDataSourceException.createForIOException(
+                        io,
+                        spec,
+                        HttpDataSource.HttpDataSourceException.TYPE_READ,
+                    )
+                }
+                throw io
+            }
+            if (read != -1) {
+                if (read > 0) {
+                    currentPos += read.toLong()
+                    baseDataSpec?.let { spec ->
+                        listeners.forEach { it.onBytesTransferred(this, spec, /* isNetwork = */ true, read) }
+                    }
+                }
+                return read
+            }
+            // Current chunk finished — advance to next bounded chunk if stream continues
+            val hasMore = (totalLength == C.LENGTH_UNSET.toLong() || currentPos < totalLength) &&
+                (requestedEndExclusive == C.LENGTH_UNSET.toLong() || currentPos < requestedEndExclusive)
+            if (!hasMore || !openNextChunk(isInitialChunk = false)) {
+                return C.RESULT_END_OF_INPUT
+            }
+        }
+    }
+
+    override fun getUri(): Uri? = activeUri ?: baseDataSpec?.uri
+
+    override fun getResponseHeaders(): Map<String, List<String>> = lastResponseHeaders
+
+    override fun close() {
+        val spec = baseDataSpec
+        val wasOpened = opened
+        try {
+            closeCurrentChunk()
+        } finally {
+            opened = false
+            baseDataSpec = null
+            resolvedBaseUrl = null
+            activeUri = null
+            totalLength = C.LENGTH_UNSET.toLong()
+            requestedEndExclusive = C.LENGTH_UNSET.toLong()
+            if (wasOpened && spec != null) {
+                listeners.forEach { it.onTransferEnd(this, spec, /* isNetwork = */ true) }
+            }
+        }
+    }
+
+    private fun closeCurrentChunk() {
+        runCatching { activeStream?.close() }
+        runCatching { activeResponse?.close() }
+        activeStream = null
+        activeResponse = null
+    }
+
+    companion object {
+        private const val CHUNK_SIZE_BYTES = 512L * 1024L // 512 KB bounded chunks
+        internal const val HEADER_USE_QUERY_RANGE = "X-PocketLink-Use-Query-Range"
+        private val RANGE_PARAM_REGEX = Regex("([?&])(?:range|rn|rbuf)=[^&]*", RegexOption.IGNORE_CASE)
+        private val CLEN_PARAM_REGEX = Regex("[?&]clen=(\\d+)", RegexOption.IGNORE_CASE)
+
+        internal fun parseContentRangeTotal(header: String?): Long? {
+            if (header.isNullOrBlank()) return null
+            val slash = header.lastIndexOf('/')
+            if (slash < 0 || slash + 1 >= header.length) return null
+            return header.substring(slash + 1).trim().toLongOrNull()
+        }
+
+        internal fun extractClenFromUrl(url: String): Long? =
+            CLEN_PARAM_REGEX.find(url)?.groupValues?.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0L }
+
+        internal fun stripRangeQueryParams(url: String): String {
+            val qIdx = url.indexOf('?')
+            if (qIdx < 0) return url
+            val base = url.substring(0, qIdx)
+            val query = url.substring(qIdx + 1)
+            val kept = query.split('&').filter { part ->
+                val key = part.substringBefore('=').lowercase()
+                part.isNotEmpty() && key != "range" && key != "rn" && key != "rbuf"
+            }
+            return if (kept.isEmpty()) base else "$base?${kept.joinToString("&")}"
+        }
+
+        internal fun buildQueryRangeUrl(url: String, start: Long, end: Long, seq: Int): String {
+            val cleaned = stripRangeQueryParams(url)
+            val sep = if (cleaned.contains('?')) '&' else '?'
+            return "$cleaned${sep}range=$start-$end&rn=$seq&rbuf=0"
+        }
+    }
+}
+
+@OptIn(UnstableApi::class)
+private class RoutingHttpDataSource(
+    private val pocketLinkClientProvider: (() -> OkHttpClient)?,
+    private val fallbackClient: OkHttpClient,
+    private val ytClientProvider: (() -> OkHttpClient)?,
+) : DataSource {
+    private var delegate: DataSource? = null
+    private val listeners = mutableListOf<TransferListener>()
+
+    override fun addTransferListener(transferListener: TransferListener) {
+        listeners.add(transferListener)
+        delegate?.addTransferListener(transferListener)
+    }
+
+    override fun open(dataSpec: DataSpec): Long {
+        val urlText = dataSpec.uri.toString()
+        val host = dataSpec.uri.host.orEmpty()
+        val activeHost = MediaPlaybackBridge.activeServerUrl
+        val isPocketLinkHost = activeHost.isNotBlank() && urlText.startsWith(activeHost, ignoreCase = true)
+        val isHlsRequest = host.contains("manifest.googlevideo.com", ignoreCase = true) ||
+            urlText.contains(".m3u8", ignoreCase = true) ||
+            urlText.contains("/hls_playlist/", ignoreCase = true) ||
+            urlText.contains("/hls_chunk/", ignoreCase = true)
+        val isGoogleVideo = !isPocketLinkHost && !isHlsRequest && host.contains("googlevideo.com", ignoreCase = true)
+        val client = if (isPocketLinkHost) {
+            pocketLinkClientProvider?.invoke() ?: fallbackClient
+        } else {
+            ytClientProvider?.invoke() ?: fallbackClient
+        }
+        val customUa = dataSpec.httpRequestHeaders.entries
+            .firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }
+            ?.value
+            ?: if (isHlsRequest) MediaPlaybackBridge.latestHlsUserAgent.takeIf { it.isNotBlank() } else null
+        val useQueryRangeHint = dataSpec.httpRequestHeaders.entries
+            .firstOrNull { it.key.equals(ChunkedYoutubeDataSource.HEADER_USE_QUERY_RANGE, ignoreCase = true) }
+            ?.value
+            .equals("true", ignoreCase = true)
+        val (created, effectiveSpec) = if (isGoogleVideo) {
+            val chunked = ChunkedYoutubeDataSource(
+                client = client,
+                userAgent = customUa,
+                initialUseQueryRange = useQueryRangeHint,
+            ).apply {
+                listeners.forEach { addTransferListener(it) }
+            }
+            chunked to dataSpec
+        } else {
+            val factory = OkHttpDataSource.Factory(client)
+            val filteredHeaders = dataSpec.httpRequestHeaders.filterKeys {
+                !it.equals("User-Agent", ignoreCase = true) &&
+                    !it.equals(ChunkedYoutubeDataSource.HEADER_USE_QUERY_RANGE, ignoreCase = true)
+            }
+            val cleanedSpec = if (!customUa.isNullOrBlank()) {
+                factory.setUserAgent(customUa)
+                dataSpec.buildUpon().setHttpRequestHeaders(filteredHeaders).build()
+            } else if (filteredHeaders.size != dataSpec.httpRequestHeaders.size) {
+                dataSpec.buildUpon().setHttpRequestHeaders(filteredHeaders).build()
+            } else {
+                dataSpec
+            }
+            val okDs = factory.createDataSource().apply {
+                listeners.forEach { addTransferListener(it) }
+            }
+            okDs to cleanedSpec
+        }
+        delegate = created
+        return created.open(effectiveSpec)
+    }
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
+        delegate?.read(buffer, offset, length) ?: C.RESULT_END_OF_INPUT
+
+    override fun getUri(): Uri? = delegate?.uri
+
+    override fun getResponseHeaders(): Map<String, List<String>> =
+        delegate?.responseHeaders.orEmpty()
+
+    override fun close() {
+        try {
+            delegate?.close()
+        } finally {
+            delegate = null
+        }
     }
 }
 
 internal object MediaPlaybackBridge {
+    @Volatile var isServiceRunning: Boolean = false
     @Volatile var isPlaying: Boolean = false
-    @Volatile var commandHandler: ((String, Long?) -> Unit)? = null
+    @Volatile var activeServerUrl: String = ""
+    @Volatile var mediaClientProvider: (() -> OkHttpClient)? = null
+    @Volatile var ytMediaClientProvider: (() -> OkHttpClient)? = null
+    @Volatile var ytStreamResolver: ((String) -> ResolvedExternalStream)? = null
+    @Volatile var onYtStreamError: ((String) -> Unit)? = null
+    @Volatile var onResolvedStreamMeta: ((String, String, String) -> Unit)? = null
+    @Volatile var skipSilenceEnabled: Boolean = false
+    @Volatile var skipSilenceListener: ((Boolean) -> Unit)? = null
+    @Volatile var latestHlsUserAgent: String = ""
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val fallbackMediaClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectionPool(ConnectionPool(6, 2, TimeUnit.MINUTES))
+            .dispatcher(Dispatcher().apply {
+                maxRequests = 16
+                maxRequestsPerHost = 6
+            })
+            .retryOnConnectionFailure(true)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .connectTimeout(12, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .build()
+    }
+
+    fun applySkipSilence(enabled: Boolean) {
+        skipSilenceEnabled = enabled
+        val listener = skipSilenceListener ?: return
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            listener(enabled)
+        } else {
+            mainHandler.post { skipSilenceListener?.invoke(enabled) }
+        }
+    }
+
+    internal fun extractVideoIdFromBridgeUri(uri: Uri): String {
+        val fromQuery = uri.getQueryParameter("v")?.trim()
+        if (!fromQuery.isNullOrEmpty()) return fromQuery
+        val fromHost = uri.host?.trim()
+        if (!fromHost.isNullOrEmpty() && !fromHost.equals("track", ignoreCase = true)) return fromHost
+        return uri.schemeSpecificPart.removePrefix("//").substringBefore('?').trim()
+    }
+
+    @OptIn(UnstableApi::class)
+    fun dynamicDataSourceFactory(context: Context): DataSource.Factory {
+        val routingHttpFactory = DataSource.Factory {
+            RoutingHttpDataSource(
+                pocketLinkClientProvider = { mediaClientProvider?.invoke() ?: fallbackMediaClient },
+                fallbackClient = fallbackMediaClient,
+                ytClientProvider = { ytMediaClientProvider?.invoke() ?: fallbackMediaClient },
+            )
+        }
+        val multiSchemeFactory = DefaultDataSource.Factory(context.applicationContext, routingHttpFactory)
+        return ResolvingDataSource.Factory(multiSchemeFactory) { dataSpec ->
+            val uri = dataSpec.uri
+            if (uri.scheme == "pocketlink-yt") {
+                val videoId = extractVideoIdFromBridgeUri(uri)
+                val resolver = ytStreamResolver
+                    ?: throw IOException("Discover audio resolver is not active")
+                val resolved = resolver(videoId)
+                onResolvedStreamMeta?.invoke(videoId, resolved.badgeLabel, resolved.sourceName)
+                if (resolved.isHls) {
+                    latestHlsUserAgent = resolved.userAgent
+                    throw HlsSwitchException(videoId, resolved)
+                }
+                val mergedHeaders = LinkedHashMap<String, String>(dataSpec.httpRequestHeaders)
+                if (resolved.userAgent.isNotBlank()) {
+                    mergedHeaders["User-Agent"] = resolved.userAgent
+                }
+                if (resolved.useQueryRange) {
+                    mergedHeaders[ChunkedYoutubeDataSource.HEADER_USE_QUERY_RANGE] = "true"
+                }
+                resolved.headers.forEach { (k, v) -> mergedHeaders[k] = v }
+                dataSpec.buildUpon()
+                    .setUri(Uri.parse(resolved.url))
+                    .setHttpRequestHeaders(mergedHeaders)
+                    .build()
+            } else {
+                dataSpec
+            }
+        }
+    }
+
+    fun isServiceActionStopIntent(context: Context): Intent =
+        Intent(context, MediaPlaybackService::class.java)
 }

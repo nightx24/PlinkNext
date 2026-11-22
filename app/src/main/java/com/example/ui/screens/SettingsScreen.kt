@@ -44,6 +44,7 @@ import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.DashboardCustomize
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.LightMode
 import androidx.compose.material.icons.rounded.MovieCreation
 import androidx.compose.material.icons.rounded.Palette
@@ -99,6 +100,7 @@ private enum class SettingsPage(val title: String) {
     DASHBOARD_SHORTCUTS("Dashboard & Shortcuts"),
     FLOATING_SHORTCUTS("Floating Shortcuts"),
     MEDIA_STORAGE("Media & Storage"),
+    YT_STREAMING("Discover"),
     NOW_PLAYING("Audio & Now Playing"),
     VIDEO_PLAYER("Video Player"),
     CONNECTION_DIAGNOSTICS("Connection & Host"),
@@ -110,6 +112,7 @@ fun SettingsScreen(
     settings: AppSettingsState,
     activeHostLabel: String? = null,
     routeType: NetworkRouteType? = null,
+    initialOpenYtStreaming: Boolean = false,
     onOpenHostSetup: () -> Unit,
     onOpenDiagnostics: () -> Unit,
     onOpenAbout: () -> Unit,
@@ -118,7 +121,13 @@ fun SettingsScreen(
 ) {
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
-    val pageStack = remember { mutableStateListOf(SettingsPage.HUB) }
+    val pageStack = remember(initialOpenYtStreaming) {
+        if (initialOpenYtStreaming) {
+            mutableStateListOf(SettingsPage.HUB, SettingsPage.YT_STREAMING)
+        } else {
+            mutableStateListOf(SettingsPage.HUB)
+        }
+    }
     var lastTransitionForward by remember { mutableStateOf(true) }
     var showReorderHomeDialog by remember { mutableStateOf(false) }
 
@@ -223,6 +232,12 @@ fun SettingsScreen(
                         settings = settings,
                         onOpenNowPlaying = { pushPage(SettingsPage.NOW_PLAYING) },
                         onOpenVideoPlayer = { pushPage(SettingsPage.VIDEO_PLAYER) },
+                        onMessage = { msg -> scope.launch { snackbarHostState.showSnackbar(msg) } },
+                    )
+
+                    SettingsPage.YT_STREAMING -> YtStreamingSettingsContent(
+                        viewModel = viewModel,
+                        settings = settings,
                         onMessage = { msg -> scope.launch { snackbarHostState.showSnackbar(msg) } },
                     )
 
@@ -438,6 +453,19 @@ private fun SettingsHubContent(
             }
         }
         item {
+            StaggeredSettingsSection(visible = revealed, delayMs = 175) {
+                SettingsCategoryCard(
+                    icon = Icons.Rounded.LibraryMusic,
+                    tint = colors.violet,
+                    title = "Discover",
+                    subtitle = "Toggle Discover streaming (NewPipe), quality, lyrics & auto-radio",
+                    badgeText = if (settings.ytStreamingEnabled) "On · ${settings.ytAudioQuality.shortLabel}" else "Off",
+                    onClick = { onSelectCategory(SettingsPage.YT_STREAMING) },
+                    testTag = "settings_cat_yt_streaming",
+                )
+            }
+        }
+        item {
             StaggeredSettingsSection(visible = revealed, delayMs = 190) {
                 SettingsCategoryCard(
                     icon = Icons.Rounded.GraphicEq,
@@ -508,21 +536,23 @@ private fun SettingsHubContent(
                 )
             }
         }
-        item {
-            StaggeredSettingsSection(visible = revealed, delayMs = 370) {
-                Spacer(Modifier.height(4.dp))
-                OutlinedButton(
-                    onClick = onDisconnect,
-                    shape = RoundedCornerShape(16.dp),
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(50.dp)
-                        .testTag("disconnect_server_btn"),
-                ) {
-                    Icon(Icons.AutoMirrored.Rounded.Logout, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Disconnect & switch server", fontWeight = FontWeight.Bold)
+        if (activeHostLabel != null) {
+            item {
+                StaggeredSettingsSection(visible = revealed, delayMs = 370) {
+                    Spacer(Modifier.height(4.dp))
+                    OutlinedButton(
+                        onClick = onDisconnect,
+                        shape = RoundedCornerShape(16.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .testTag("disconnect_server_btn"),
+                    ) {
+                        Icon(Icons.AutoMirrored.Rounded.Logout, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Disconnect & switch server", fontWeight = FontWeight.Bold)
+                    }
                 }
             }
         }

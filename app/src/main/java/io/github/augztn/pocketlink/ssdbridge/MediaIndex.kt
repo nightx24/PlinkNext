@@ -17,13 +17,25 @@ internal data class IndexedFile(
     val size: Long,
     val modified: Long,
     val mime: String,
-    val category: String?
+    val category: String?,
+    val title: String? = null,
+    val artist: String? = null,
+    val album: String? = null,
+    val durationMs: Long = 0L,
+    val sampleRateHz: Int = 0,
+    val bitDepth: Int = 0,
+    val hasLyrics: Boolean = false,
 )
 
 internal data class IndexStamp(val size: Long, val modified: Long, val category: String? = null)
 
 internal class MediaIndexDatabase(context: Context) :
-    SQLiteOpenHelper(context, "pocketlink_index.db", null, 1) {
+    SQLiteOpenHelper(context, "pocketlink_index.db", null, 2) {
+
+    override fun onConfigure(db: SQLiteDatabase) {
+        super.onConfigure(db)
+        db.enableWriteAheadLogging()
+    }
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("""
@@ -39,6 +51,11 @@ internal class MediaIndexDatabase(context: Context) :
                 volume TEXT NOT NULL, path TEXT NOT NULL, name TEXT NOT NULL,
                 category TEXT NOT NULL, size INTEGER NOT NULL, modified INTEGER NOT NULL,
                 mime TEXT NOT NULL, scan_id TEXT NOT NULL,
+                title TEXT, artist TEXT, album TEXT,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                sample_rate INTEGER NOT NULL DEFAULT 0,
+                bit_depth INTEGER NOT NULL DEFAULT 0,
+                has_lyrics INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(volume, path)
             )
         """.trimIndent())
@@ -48,7 +65,20 @@ internal class MediaIndexDatabase(context: Context) :
         db.execSQL("CREATE INDEX media_modified_idx ON media(category, modified DESC)")
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) {
+            listOf(
+                "ALTER TABLE media ADD COLUMN title TEXT",
+                "ALTER TABLE media ADD COLUMN artist TEXT",
+                "ALTER TABLE media ADD COLUMN album TEXT",
+                "ALTER TABLE media ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE media ADD COLUMN sample_rate INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE media ADD COLUMN bit_depth INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE media ADD COLUMN has_lyrics INTEGER NOT NULL DEFAULT 0",
+                "UPDATE media SET modified = 0 WHERE category = 'music'",
+            ).forEach { sql -> runCatching { db.execSQL(sql) } }
+        }
+    }
 
     fun upsertFiles(batch: List<IndexedFile>, scanId: String) {
         if (batch.isEmpty()) return
@@ -84,8 +114,10 @@ internal class MediaIndexDatabase(context: Context) :
         db.beginTransaction()
         try {
             val statement = db.compileStatement("""
-                INSERT OR REPLACE INTO media(volume,path,name,category,size,modified,mime,scan_id)
-                VALUES(?,?,?,?,?,?,?,?)
+                INSERT OR REPLACE INTO media(
+                    volume,path,name,category,size,modified,mime,scan_id,
+                    title,artist,album,duration_ms,sample_rate,bit_depth,has_lyrics
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """.trimIndent())
             try {
                 mediaItems.forEach { item ->
@@ -98,6 +130,13 @@ internal class MediaIndexDatabase(context: Context) :
                     statement.bindLong(6, item.modified)
                     statement.bindString(7, item.mime)
                     statement.bindString(8, scanId)
+                    if (item.title.isNullOrBlank()) statement.bindNull(9) else statement.bindString(9, item.title)
+                    if (item.artist.isNullOrBlank()) statement.bindNull(10) else statement.bindString(10, item.artist)
+                    if (item.album.isNullOrBlank()) statement.bindNull(11) else statement.bindString(11, item.album)
+                    statement.bindLong(12, item.durationMs)
+                    statement.bindLong(13, item.sampleRateHz.toLong())
+                    statement.bindLong(14, item.bitDepth.toLong())
+                    statement.bindLong(15, if (item.hasLyrics) 1L else 0L)
                     statement.executeInsert()
                 }
             } finally { statement.close() }
@@ -160,18 +199,36 @@ internal class MediaIndexDatabase(context: Context) :
 
     fun queryMedia(category: String, query: String, limit: Int, offset: Int): List<IndexedFile> {
         val rows = mutableListOf<IndexedFile>()
-        val where = if (query.isBlank()) "category=?" else "category=? AND (name LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\')"
+        val where = if (query.isBlank()) {
+            "category=?"
+        } else {
+            "category=? AND (name LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\' OR artist LIKE ? ESCAPE '\\' OR album LIKE ? ESCAPE '\\')"
+        }
         val args = if (query.isBlank()) arrayOf(category) else {
             val escaped = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-            arrayOf(category, escaped, escaped)
+            arrayOf(category, escaped, escaped, escaped, escaped, escaped)
         }
         readableDatabase.query(
-            "media", arrayOf("volume","path","name","category","size","modified","mime"),
+            "media",
+            arrayOf("volume", "path", "name", "category", "size", "modified", "mime", "title", "artist", "album", "duration_ms", "sample_rate", "bit_depth", "has_lyrics"),
             where, args, null, null, "name COLLATE NOCASE ASC", "$offset,$limit"
         ).use { cursor ->
             while (cursor.moveToNext()) rows += IndexedFile(
-                cursor.getString(0), cursor.getString(1), cursor.getString(2), "file",
-                cursor.getLong(4), cursor.getLong(5), cursor.getString(6), cursor.getString(3)
+                volume = cursor.getString(0),
+                path = cursor.getString(1),
+                name = cursor.getString(2),
+                type = "file",
+                size = cursor.getLong(4),
+                modified = cursor.getLong(5),
+                mime = cursor.getString(6),
+                category = cursor.getString(3),
+                title = cursor.getString(7)?.takeIf { it.isNotBlank() },
+                artist = cursor.getString(8)?.takeIf { it.isNotBlank() },
+                album = cursor.getString(9)?.takeIf { it.isNotBlank() },
+                durationMs = cursor.getLong(10),
+                sampleRateHz = cursor.getInt(11),
+                bitDepth = cursor.getInt(12),
+                hasLyrics = cursor.getInt(13) != 0,
             )
         }
         return rows
@@ -218,7 +275,8 @@ internal class MediaIndexScanner(
     private val scopedStorage: ScopedStorageRegistry,
     private val externalRoots: () -> List<Pair<String, DocumentFile>>
 ) {
-    private val database = MediaIndexDatabase(context.applicationContext)
+    private val appContext = context.applicationContext
+    private val database = MediaIndexDatabase(appContext)
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "PocketLink-MediaIndex").apply { isDaemon = true }
     }
@@ -338,7 +396,15 @@ internal class MediaIndexScanner(
             unchangedFiles.clear()
             unchangedMedia.clear()
         }
-        fun add(path: String, name: String, directory: Boolean, size: Long, modified: Long, mime: String) {
+        fun add(
+            path: String,
+            name: String,
+            directory: Boolean,
+            size: Long,
+            modified: Long,
+            mime: String,
+            audioMetaProvider: (() -> ExtractedAudioMetadata)? = null,
+        ) {
             val safeSize = size.coerceAtLeast(0L)
             val safeModified = modified.coerceAtLeast(0L)
             val category = if (directory) null else categoryFor(name)
@@ -355,8 +421,26 @@ internal class MediaIndexScanner(
                 unchangedFiles += path
                 if (category != null) unchangedMedia += path
             } else {
-                batch += IndexedFile(volume, path, name, if (directory) "directory" else "file",
-                    safeSize, safeModified, mime, category)
+                val meta = if (category == "music" && !directory && audioMetaProvider != null) {
+                    runCatching { audioMetaProvider() }.getOrNull()
+                } else null
+                batch += IndexedFile(
+                    volume = volume,
+                    path = path,
+                    name = name,
+                    type = if (directory) "directory" else "file",
+                    size = safeSize,
+                    modified = safeModified,
+                    mime = mime,
+                    category = category,
+                    title = meta?.title?.takeIf { it.isNotBlank() },
+                    artist = meta?.artist?.takeIf { it.isNotBlank() },
+                    album = meta?.album?.takeIf { it.isNotBlank() },
+                    durationMs = meta?.durationMs ?: 0L,
+                    sampleRateHz = meta?.sampleRateHz ?: 0,
+                    bitDepth = meta?.bitDepth ?: 0,
+                    hasLyrics = meta?.hasEmbeddedLyrics == true,
+                )
             }
             if (batch.size >= 200 || unchangedFiles.size >= 200) flush()
         }
@@ -388,8 +472,17 @@ internal class MediaIndexScanner(
                     val relative = if (pathPrefix.isEmpty()) sub else "$pathPrefix/$sub"
                     if (seenPaths.add(relative)) {
                         if (child.isFile) seenNames.add(child.name.lowercase())
-                        add(relative, child.name, child.isDirectory, if (child.isFile) child.length() else 0L,
-                            child.lastModified(), mimeForName(child.name))
+                        add(
+                            path = relative,
+                            name = child.name,
+                            directory = child.isDirectory,
+                            size = if (child.isFile) child.length() else 0L,
+                            modified = child.lastModified(),
+                            mime = mimeForName(child.name),
+                            audioMetaProvider = if (child.isFile) {
+                                { AudioMetadataExtractor.extractFromFile(child, includeLyrics = true) }
+                            } else null,
+                        )
                     }
                     if (child.isDirectory) {
                         if (depth < maxDepth) stack.add(child to depth + 1)
@@ -418,8 +511,18 @@ internal class MediaIndexScanner(
                     val relative = if (parentPath.isEmpty()) name else "$parentPath/$name"
                     if (seenPaths.add(relative)) {
                         if (child.isFile) seenNames.add(name.lowercase())
-                        add(relative, name, child.isDirectory, if (child.isFile) child.length() else 0L,
-                            child.lastModified(), child.type ?: mimeForName(name))
+                        val fileLen = if (child.isFile) child.length() else 0L
+                        add(
+                            path = relative,
+                            name = name,
+                            directory = child.isDirectory,
+                            size = fileLen,
+                            modified = child.lastModified(),
+                            mime = child.type ?: mimeForName(name),
+                            audioMetaProvider = if (child.isFile) {
+                                { AudioMetadataExtractor.extractFromUri(appContext, child.uri, name, fileLen, includeLyrics = true) }
+                            } else null,
+                        )
                     }
                     if (child.isDirectory) {
                         if (depth < maxDepth) stack.add((child to relative) to depth + 1)
@@ -456,7 +559,17 @@ internal class MediaIndexScanner(
                     val alreadyIndexed = ms.realRelativePath?.let { it in seenPaths } == true ||
                         (ms.size > 0L && ms.name.lowercase() in seenNames && ms.realRelativePath?.contains('/') == true)
                     if (!alreadyIndexed && seenPaths.add(ms.virtualPath)) {
-                        add(ms.virtualPath, ms.name, false, ms.size, ms.modifiedMs, ms.mime)
+                        add(
+                            path = ms.virtualPath,
+                            name = ms.name,
+                            directory = false,
+                            size = ms.size,
+                            modified = ms.modifiedMs,
+                            mime = ms.mime,
+                            audioMetaProvider = {
+                                AudioMetadataExtractor.extractFromUri(appContext, ms.uri, ms.name, ms.size, includeLyrics = true)
+                            },
+                        )
                     }
                 }
             }
@@ -518,7 +631,7 @@ internal class MediaIndexScanner(
     companion object {
         private const val RESCAN_INTERVAL_MS = 10 * 60 * 1000L
         private const val MAX_DEPTH = 64
-        private val AUDIO = setOf("mp3","m4a","aac","wav","flac","ogg","opus","wma","aiff","alac")
+        private val AUDIO = setOf("mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma", "aiff", "aif", "alac", "wv", "ape", "dsf", "dff")
         private val VIDEO = setOf("mp4","m4v","mov","mkv","webm","avi","wmv","mpeg","mpg","3gp","ts","m2ts","mts","flv","f4v","3g2","m2v","ogv","vob","rmvb")
         private val PHOTO = setOf("jpg","jpeg","png","webp","gif","bmp","heic","heif","avif")
 
@@ -530,8 +643,10 @@ internal class MediaIndexScanner(
         }
 
         private fun mimeForName(name: String): String = when (name.substringAfterLast('.', "").lowercase()) {
-            "mp3" -> "audio/mpeg"; "m4a" -> "audio/mp4"; "aac" -> "audio/aac"; "flac" -> "audio/flac"
-            "ogg","opus" -> "audio/ogg"; "wav" -> "audio/wav"; "mp4","m4v" -> "video/mp4"
+            "mp3" -> "audio/mpeg"; "m4a", "alac" -> "audio/mp4"; "aac" -> "audio/aac"; "flac" -> "audio/flac"
+            "ogg", "opus" -> "audio/ogg"; "wav" -> "audio/wav"; "aiff", "aif" -> "audio/aiff"
+            "wv" -> "audio/x-wavpack"; "ape" -> "audio/x-ape"; "dsf", "dff" -> "audio/dsd"
+            "mp4", "m4v" -> "video/mp4"
             "mkv" -> "video/x-matroska"; "jpg","jpeg" -> "image/jpeg"; "png" -> "image/png"
             "webp" -> "image/webp"; "gif" -> "image/gif"; "pdf" -> "application/pdf"
             else -> "application/octet-stream"

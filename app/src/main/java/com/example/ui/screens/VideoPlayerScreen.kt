@@ -111,20 +111,21 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.okhttp.OkHttpDataSource
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import io.github.augztn.pocketlink.ssdbridge.PocketLinkMediaEngine
 import com.example.data.model.AppSettingsState
 import com.example.data.model.IndexedFile
 import com.example.data.model.formatDurationMs
 import com.example.data.network.PocketLinkApi
+import com.example.ui.components.GlassPlayerSurface
 import com.example.ui.theme.CyanAccent
 import com.example.ui.theme.IndigoPrimary
 import com.example.ui.theme.TealAccent
@@ -161,15 +162,17 @@ fun VideoPlayerScreen(
 
     val exoPlayer = remember(streamUrl) {
         val dsFactory = OkHttpDataSource.Factory(api.mediaClient)
-        ExoPlayer.Builder(context)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(dsFactory))
-            .build()
-            .apply {
-                setMediaItem(MediaItem.fromUri(streamUrl))
-                playbackParameters = PlaybackParameters(settings.videoDefaultSpeed)
-                prepare()
-                playWhenReady = true
-            }
+        PocketLinkMediaEngine.buildExoPlayer(
+            context = context,
+            dataSourceFactory = dsFactory,
+            contentType = C.AUDIO_CONTENT_TYPE_MOVIE,
+            handleWakeMode = false,
+        ).apply {
+            setMediaItem(MediaItem.fromUri(streamUrl))
+            playbackParameters = PlaybackParameters(settings.videoDefaultSpeed)
+            playWhenReady = true
+            prepare()
+        }
     }
 
     var isPlaying by remember { mutableStateOf(true) }
@@ -460,33 +463,39 @@ fun VideoPlayerScreen(
         }
 
         errorMessage?.let { err ->
-            Column(
+            GlassPlayerSurface(
+                shape = RoundedCornerShape(22.dp),
+                containerColor = Color(0xFF14161D).copy(alpha = 0.62f),
+                accentGlow = IndigoPrimary,
+                borderColor = Color.White.copy(alpha = 0.24f),
+                blurRadius = 22.dp,
+                shadowElevation = 12.dp,
                 modifier = Modifier
                     .align(Alignment.Center)
-                    .padding(horizontal = 24.dp)
-                    .clip(RoundedCornerShape(18.dp))
-                    .background(Color(0xDD14161D))
-                    .border(1.dp, Color.White.copy(alpha = 0.14f), RoundedCornerShape(18.dp))
-                    .padding(18.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+                    .padding(horizontal = 24.dp),
             ) {
-                Text(
-                    text = err,
-                    color = Color.White,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Button(
-                    onClick = {
-                        errorMessage = null
-                        exoPlayer.prepare()
-                        exoPlayer.playWhenReady = true
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = IndigoPrimary),
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Retry stream")
+                    Text(
+                        text = err,
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Button(
+                        onClick = {
+                            errorMessage = null
+                            exoPlayer.prepare()
+                            exoPlayer.playWhenReady = true
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = IndigoPrimary),
+                    ) {
+                        Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Retry stream")
+                    }
                 }
             }
         }
@@ -501,10 +510,13 @@ fun VideoPlayerScreen(
                 .systemBarsPadding()
                 .padding(top = 74.dp),
         ) {
-            Surface(
-                color = Color(0xCC11131A),
+            GlassPlayerSurface(
                 shape = RoundedCornerShape(50),
-                modifier = Modifier.border(1.dp, Color.White.copy(alpha = 0.2f), RoundedCornerShape(50)),
+                containerColor = Color(0xFF11131A).copy(alpha = 0.56f),
+                accentGlow = TealAccent,
+                borderColor = Color.White.copy(alpha = 0.28f),
+                blurRadius = 20.dp,
+                shadowElevation = 8.dp,
             ) {
                 Row(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -538,11 +550,14 @@ fun VideoPlayerScreen(
                 .systemBarsPadding()
                 .padding(bottom = 32.dp),
         ) {
-            Surface(
-                color = Color(0xDD14161E),
+            GlassPlayerSurface(
                 shape = RoundedCornerShape(50),
+                containerColor = Color(0xFF14161E).copy(alpha = 0.62f),
+                accentGlow = TealAccent,
+                borderColor = Color.White.copy(alpha = 0.30f),
+                blurRadius = 20.dp,
+                shadowElevation = 10.dp,
                 modifier = Modifier
-                    .border(1.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(50))
                     .clip(RoundedCornerShape(50))
                     .clickable {
                         controlsLocked = false
@@ -584,13 +599,16 @@ fun VideoPlayerScreen(
                     .padding(horizontal = 16.dp, vertical = 12.dp),
             ) {
                 // Top Glass Header Bar
-                Surface(
-                    color = Color(0x9A151822),
+                GlassPlayerSurface(
                     shape = RoundedCornerShape(22.dp),
+                    containerColor = Color(0xFF121520).copy(alpha = 0.50f),
+                    accentGlow = IndigoPrimary,
+                    borderColor = Color.White.copy(alpha = 0.24f),
+                    blurRadius = 24.dp,
+                    shadowElevation = 10.dp,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .align(Alignment.TopCenter)
-                        .border(1.dp, Color.White.copy(alpha = 0.16f), RoundedCornerShape(22.dp)),
+                        .align(Alignment.TopCenter),
                 ) {
                     Row(
                         modifier = Modifier
@@ -672,19 +690,23 @@ fun VideoPlayerScreen(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Box(
+                        GlassPlayerSurface(
+                            shape = CircleShape,
+                            containerColor = Color(0xFF141722).copy(alpha = 0.48f),
+                            accentGlow = Color.White,
+                            borderColor = Color.White.copy(alpha = 0.26f),
+                            blurRadius = 20.dp,
+                            shadowElevation = 8.dp,
+                            contentAlignment = Alignment.Center,
                             modifier = Modifier
                                 .size(54.dp)
                                 .clip(CircleShape)
-                                .background(Color(0x88141720))
-                                .border(1.dp, Color.White.copy(alpha = 0.16f), CircleShape)
                                 .clickable {
                                     val target = (exoPlayer.currentPosition - settings.videoSeekSeconds * 1000L).coerceAtLeast(0L)
                                     exoPlayer.seekTo(target)
                                     positionMs = target
                                     showHud("-${settings.videoSeekSeconds}s")
                                 },
-                            contentAlignment = Alignment.Center,
                         ) {
                             Icon(Icons.Rounded.FastRewind, contentDescription = "Rewind", tint = Color.White, modifier = Modifier.size(28.dp))
                         }
@@ -692,18 +714,20 @@ fun VideoPlayerScreen(
                         Text("-${settings.videoSeekSeconds}s", style = MaterialTheme.typography.labelSmall, color = Color.White.copy(alpha = 0.85f))
                     }
 
-                    Box(
+                    GlassPlayerSurface(
+                        shape = CircleShape,
+                        containerColor = IndigoPrimary.copy(alpha = 0.62f),
+                        accentGlow = IndigoPrimary,
+                        borderColor = Color.White.copy(alpha = 0.42f),
+                        blurRadius = 22.dp,
+                        shadowElevation = 14.dp,
+                        contentAlignment = Alignment.Center,
                         modifier = Modifier
                             .size(72.dp)
                             .clip(CircleShape)
-                            .background(
-                                Brush.linearGradient(listOf(IndigoPrimary, Color(0xFF3E55EC)))
-                            )
-                            .border(1.2.dp, Color.White.copy(alpha = 0.35f), CircleShape)
                             .clickable {
                                 if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
                             },
-                        contentAlignment = Alignment.Center,
                     ) {
                         AnimatedContent(
                             targetState = isPlaying,
@@ -722,12 +746,17 @@ fun VideoPlayerScreen(
                     }
 
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Box(
+                        GlassPlayerSurface(
+                            shape = CircleShape,
+                            containerColor = Color(0xFF141722).copy(alpha = 0.48f),
+                            accentGlow = Color.White,
+                            borderColor = Color.White.copy(alpha = 0.26f),
+                            blurRadius = 20.dp,
+                            shadowElevation = 8.dp,
+                            contentAlignment = Alignment.Center,
                             modifier = Modifier
                                 .size(54.dp)
                                 .clip(CircleShape)
-                                .background(Color(0x88141720))
-                                .border(1.dp, Color.White.copy(alpha = 0.16f), CircleShape)
                                 .clickable {
                                     val maxDur = exoPlayer.duration.takeIf { it > 0L } ?: Long.MAX_VALUE
                                     val target = (exoPlayer.currentPosition + settings.videoSeekSeconds * 1000L).coerceAtMost(maxDur)
@@ -735,7 +764,6 @@ fun VideoPlayerScreen(
                                     positionMs = target
                                     showHud("+${settings.videoSeekSeconds}s")
                                 },
-                            contentAlignment = Alignment.Center,
                         ) {
                             Icon(Icons.Rounded.FastForward, contentDescription = "Forward", tint = Color.White, modifier = Modifier.size(28.dp))
                         }
@@ -745,13 +773,16 @@ fun VideoPlayerScreen(
                 }
 
                 // Bottom Scrubbing Glass Panel
-                Surface(
-                    color = Color(0xA6141720),
-                    shape = RoundedCornerShape(22.dp),
+                GlassPlayerSurface(
+                    shape = RoundedCornerShape(24.dp),
+                    containerColor = Color(0xFF121520).copy(alpha = 0.52f),
+                    accentGlow = IndigoPrimary,
+                    borderColor = Color.White.copy(alpha = 0.24f),
+                    blurRadius = 24.dp,
+                    shadowElevation = 12.dp,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .align(Alignment.BottomCenter)
-                        .border(1.dp, Color.White.copy(alpha = 0.16f), RoundedCornerShape(22.dp)),
+                        .align(Alignment.BottomCenter),
                 ) {
                     Column(
                         modifier = Modifier
@@ -830,13 +861,16 @@ fun VideoPlayerScreen(
                     .padding(16.dp),
                 contentAlignment = Alignment.BottomCenter,
             ) {
-                Surface(
-                    color = Color(0xF0151822),
+                GlassPlayerSurface(
                     shape = RoundedCornerShape(26.dp),
+                    containerColor = Color(0xFF141722).copy(alpha = 0.72f),
+                    accentGlow = TealAccent,
+                    borderColor = Color.White.copy(alpha = 0.24f),
+                    blurRadius = 26.dp,
+                    shadowElevation = 16.dp,
                     modifier = Modifier
                         .widthIn(max = 540.dp)
                         .fillMaxWidth()
-                        .border(1.dp, Color.White.copy(alpha = 0.16f), RoundedCornerShape(26.dp))
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null,

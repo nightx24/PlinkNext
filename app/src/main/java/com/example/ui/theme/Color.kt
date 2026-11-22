@@ -15,6 +15,7 @@ val VioletAccent = Color(0xFF8D72E8)
 val SkyAccent = Color(0xFF60A5FA)
 val CoralError = Color(0xFFFF6B6B)
 val EmeraldSuccess = Color(0xFF4ADE80)
+val CloudflareOrange = Color(0xFFF38020)
 
 // Original Obsidian / Liquid Glass Dark Surfaces
 val DarkBackground = Color(0xFF000000)
@@ -40,6 +41,7 @@ val TealLightAccent = Color(0xFF0D9488)
 val VioletLightAccent = Color(0xFF6D4AFF)
 val SkyLightAccent = Color(0xFF2563EB)
 val EmeraldLightSuccess = Color(0xFF059669)
+val CloudflareLightOrange = Color(0xFFD9640C)
 
 // Light Surfaces (pure white elevated cards over airy cool-slate pearl background)
 val LightBackground = Color(0xFFF3F5FB)

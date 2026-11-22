@@ -13,6 +13,7 @@ import android.util.Base64
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
 import org.json.JSONObject
+import io.github.augztn.pocketlink.ssdbridge.tunnel.TunnelManager
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.NetworkInterface
@@ -59,6 +60,7 @@ class LocalHostController(private val context: Context) {
         appContext.getSharedPreferences("ssd-bridge", Context.MODE_PRIVATE)
     }
     private val scopedStorage by lazy { ScopedStorageRegistry(appContext) }
+    val tunnelManager: TunnelManager by lazy { TunnelManager.getInstance(appContext) }
 
     fun getStatus(): LocalHostStatus {
         val discovered = discoverPhysicalVolumes().map { (id, volume) ->
@@ -171,7 +173,31 @@ class LocalHostController(private val context: Context) {
     }
 
     fun stopServer() {
+        tunnelManager.stopActiveTunnel()
         appContext.stopService(Intent(appContext, BridgeService::class.java))
+    }
+
+    fun startTunnel(): Result<Unit> = runCatching {
+        if (!BridgeService.isRunning) {
+            startServer().getOrThrow()
+        }
+        val intent = Intent(appContext, BridgeService::class.java).apply {
+            action = BridgeService.ACTION_START_TUNNEL
+        }
+        ContextCompat.startForegroundService(appContext, intent)
+        tunnelManager.startActiveTunnel(NativeApiServer.PORT).getOrThrow()
+    }
+
+    fun stopTunnel() {
+        tunnelManager.stopActiveTunnel()
+        if (BridgeService.isRunning) {
+            runCatching {
+                val intent = Intent(appContext, BridgeService::class.java).apply {
+                    action = BridgeService.ACTION_STOP_TUNNEL
+                }
+                appContext.startService(intent)
+            }
+        }
     }
 
     fun refreshMediaIndex(): Result<Unit> = runCatching {
@@ -330,39 +356,5 @@ class LocalHostController(private val context: Context) {
 
     companion object {
         const val TAILSCALE_PACKAGE = "com.tailscale.ipn"
-
-        fun setMediaCommandHandler(handler: ((String, Long?) -> Unit)?) {
-            MediaPlaybackBridge.commandHandler = handler
-        }
-
-        fun updateMediaNotification(
-            context: Context,
-            title: String,
-            artist: String,
-            playing: Boolean,
-            positionMs: Long,
-            durationMs: Long,
-            startForeground: Boolean,
-        ) {
-            val intent = Intent(context, MediaPlaybackService::class.java).apply {
-                action = MediaPlaybackService.ACTION_UPDATE
-                putExtra(MediaPlaybackService.EXTRA_TITLE, title)
-                putExtra(MediaPlaybackService.EXTRA_ARTIST, artist)
-                putExtra(MediaPlaybackService.EXTRA_PLAYING, playing)
-                putExtra(MediaPlaybackService.EXTRA_POSITION, positionMs)
-                putExtra(MediaPlaybackService.EXTRA_DURATION, durationMs)
-            }
-            runCatching {
-                if (startForeground) {
-                    ContextCompat.startForegroundService(context, intent)
-                } else {
-                    context.startService(intent)
-                }
-            }
-        }
-
-        fun stopMediaNotification(context: Context) {
-            context.stopService(Intent(context, MediaPlaybackService::class.java))
-        }
     }
 }

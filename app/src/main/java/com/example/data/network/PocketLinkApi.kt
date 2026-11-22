@@ -18,7 +18,9 @@ import com.example.data.model.classifyNetworkRoute
 import com.example.data.store.AppLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionPool
 import okhttp3.Credentials
+import okhttp3.Dispatcher
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
@@ -57,7 +59,9 @@ class PocketLinkApi(
                     )
                 }
             }
-            val needsAuth = !req.url.encodedPath.endsWith("/health")
+            val reqUrl = req.url.toString()
+            val targetsThisServer = reqUrl.startsWith(baseUrl)
+            val needsAuth = targetsThisServer && !req.url.encodedPath.endsWith("/health")
             val next = if (needsAuth && req.header("Authorization") == null) {
                 req.newBuilder().header("Authorization", authHeader).build()
             } else {
@@ -238,6 +242,33 @@ class PocketLinkApi(
             status = parseIndexStatus(json.optJSONObject("status") ?: JSONObject()),
         )
     }
+
+    /**
+     * Fetches embedded tag lyrics (FLAC VORBIS_COMMENT / ID3v2 USLT / MP4 ©lyr) or sidecar .lrc
+     * text for an audio file hosted on the PocketLink server.
+     */
+    suspend fun fetchHostAudioLyrics(path: String, volume: String? = null): Pair<String, String>? =
+        withContext(Dispatchers.IO) {
+            if (path.isBlank()) return@withContext null
+            val builder = "$baseUrl/api/media/lyrics".toHttpUrl().newBuilder()
+                .addQueryParameter("path", path)
+            if (!volume.isNullOrBlank() && volume != "internal") {
+                builder.addQueryParameter("volume", volume)
+            }
+            val req = Request.Builder().url(builder.build()).get().build()
+            runCatching {
+                httpClient.newCall(req).execute().use { res ->
+                    if (!res.isSuccessful) return@runCatching null
+                    val raw = res.body?.string().orEmpty()
+                    if (raw.isBlank()) return@runCatching null
+                    val json = JSONObject(raw)
+                    val lyrics = json.optString("lyrics").trim()
+                    if (lyrics.isEmpty()) return@runCatching null
+                    val source = json.optString("source").ifBlank { "Host Embedded" }
+                    lyrics to source
+                }
+            }.getOrNull()
+        }
 
     suspend fun searchIndexedFiles(
         query: String = "",
@@ -539,6 +570,13 @@ class PocketLinkApi(
                         modified = o.opt("modified")?.toString().orEmpty(),
                         mime = o.optString("mime", "application/octet-stream"),
                         category = o.optStringOrNull("category"),
+                        artist = o.optStringOrNull("artist"),
+                        title = o.optStringOrNull("title"),
+                        album = o.optStringOrNull("album"),
+                        durationMs = o.optLong("duration_ms", 0L),
+                        sampleRateHz = o.optInt("sample_rate", 0),
+                        bitDepth = o.optInt("bit_depth", 0),
+                        hasEmbeddedLyrics = o.optBoolean("has_lyrics", false),
                     )
                 )
             }
@@ -548,7 +586,13 @@ class PocketLinkApi(
     companion object {
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
         private val sharedBaseClient: OkHttpClient = OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
+            .connectionPool(ConnectionPool(12, 2, TimeUnit.MINUTES))
+            .dispatcher(Dispatcher().apply {
+                maxRequests = 32
+                maxRequestsPerHost = 12
+            })
+            .retryOnConnectionFailure(true)
+            .connectTimeout(12, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
             .build()
