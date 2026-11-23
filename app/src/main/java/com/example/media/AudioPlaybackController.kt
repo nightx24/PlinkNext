@@ -216,8 +216,9 @@ class AudioPlaybackController(context: Context) {
 
             if (activeTrack != null && activeTrack.isYouTubeStream) {
                 MediaPlaybackBridge.onYtStreamError?.invoke(activeTrack.path)
+                val resolverAlreadyExhausted = rootCauseMsg.startsWith("Unable to play track", ignoreCase = true)
                 val attempts = retryCountByVideoId[activeTrack.path] ?: 0
-                if (attempts < MAX_DISCOVER_FAILOVER_RETRIES) {
+                if (!resolverAlreadyExhausted && attempts < MAX_DISCOVER_FAILOVER_RETRIES) {
                     retryCountByVideoId[activeTrack.path] = attempts + 1
                     AppLogger.info(
                         "Retrying Discover stream with next client (${attempts + 1}/$MAX_DISCOVER_FAILOVER_RETRIES)",

@@ -140,6 +140,7 @@ private data class InnertubePlayerClient(
     val androidSdkVersion: Int? = null,
     val embedUrl: String? = null,
     val isWebClient: Boolean = false,
+    val useVisitorData: Boolean = false,
 )
 
 class YtMusicClient {
@@ -150,6 +151,11 @@ class YtMusicClient {
     @Volatile var lastResolutionTrace: StreamResolutionTrace? = null
         private set
     @Volatile private var visitorData: String = ""
+    @Volatile private var lastWorkingPipedHost: String? = null
+    @Volatile private var lastWorkingInvidiousHost: String? = null
+    @Volatile private var discoveredPipedHosts: List<String> = emptyList()
+    @Volatile private var discoveredInvidiousHosts: List<String> = emptyList()
+    @Volatile private var lastProxyDiscoveryAtMs: Long = 0L
 
     fun effectiveAudioQuality(): YtAudioQuality =
         resolveEffectiveQuality(audioQuality, runCatching { isUnmeteredNetworkProvider() }.getOrDefault(true))
@@ -186,6 +192,18 @@ class YtMusicClient {
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)
         .writeTimeout(20, TimeUnit.SECONDS)
+        .build()
+
+    // Fast-fail OkHttpClient dedicated to public Piped/Invidious failover & instance discovery
+    private val proxyClient: OkHttpClient = OkHttpClient.Builder()
+        .connectionPool(sharedConnectionPool)
+        .retryOnConnectionFailure(false)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .connectTimeout(4, TimeUnit.SECONDS)
+        .readTimeout(6, TimeUnit.SECONDS)
+        .writeTimeout(4, TimeUnit.SECONDS)
+        .callTimeout(8, TimeUnit.SECONDS)
         .build()
 
     private val newPipeExtractor: NewPipeAudioExtractor by lazy {
@@ -558,17 +576,22 @@ class YtMusicClient {
             }
         }
 
-        // Direct InnerTube multi-client waterfall (ANDROID_VR / TV_EMBED / ANDROID_MUSIC return direct Opus 251/250/249)
+        // Direct InnerTube multi-client waterfall (ANDROID_VR / WEB_EMBEDDED / VISIONOS / TVHTML5 / IOS)
         if (profile != "NEWPIPE" || errors.isNotEmpty() || deferredNonOpusCandidates.isNotEmpty()) {
-            ensureVisitorData()
             val baseCandidates = orderedClients(profile)
             // Move any client that previously returned a playback 403 for this videoId to the back
             val candidates = baseCandidates.filterNot { it.id in deprioritizedClients } +
                 baseCandidates.filter { it.id in deprioritizedClients }
+            val loginBlockedClientFamilies = HashSet<String>()
             for (client in candidates) {
+                if (client.clientName in loginBlockedClientFamilies) continue
                 try {
-                    val playerJson = postYoutubePlayer(cleanId, client, countryCode, visitorData)
-                    captureVisitorData(playerJson)
+                    val activeVisitor = if (client.useVisitorData) {
+                        ensureVisitorData()
+                        visitorData
+                    } else ""
+                    val playerJson = postYoutubePlayer(cleanId, client, countryCode, activeVisitor)
+                    if (client.useVisitorData) captureVisitorData(playerJson)
                     val ordered = selectOrderedAudioStreams(
                         playerJson = playerJson,
                         quality = effectiveQuality,
@@ -581,6 +604,11 @@ class YtMusicClient {
                         val status = playerJson.optJSONObject("playabilityStatus")?.optString("status").orEmpty()
                         if (status.isNotBlank()) {
                             errors.add("${client.id}: $status ${reason.take(60)}".trim())
+                            if (status.equals("LOGIN_REQUIRED", ignoreCase = true)) {
+                                // Skip redundant version variants of the same client family (e.g., 4x ANDROID_VR)
+                                loginBlockedClientFamilies.add(client.clientName)
+                                if (client.useVisitorData) visitorData = ""
+                            }
                         }
                         continue
                     }
@@ -617,8 +645,8 @@ class YtMusicClient {
             }
         }
 
-        // === PASS 3: PUBLIC PIPED / INVIDIOUS PROXY FAILOVER (OPUS-FIRST) ===
-        val proxyStream = resolveViaPipedOrInvidious(cleanId, effectiveQuality)
+        // === PASS 3: PUBLIC PIPED / INVIDIOUS PROXY FAILOVER (DYNAMIC DISCOVERY + MULTI-CANDIDATE) ===
+        val proxyStream = resolveViaPipedOrInvidious(cleanId, effectiveQuality, ::probeCandidate, errors)
         if (proxyStream != null) {
             return recordAndReturn(proxyStream)
         }
@@ -634,7 +662,15 @@ class YtMusicClient {
             selected = null,
             errors = errors.toList(),
         )
-        val summary = errors.take(2).joinToString(" | ").ifBlank { "No playable audio stream available" }
+        val hasBotWall = errors.any {
+            it.contains("LOGIN_REQUIRED", ignoreCase = true) ||
+                it.contains("not a bot", ignoreCase = true)
+        }
+        val summary = if (hasBotWall) {
+            "YouTube blocked anonymous playback on this network/IP (bot check). Switch Wi-Fi/mobile data or disable VPN, then tap Retry."
+        } else {
+            errors.take(2).joinToString(" | ").ifBlank { "No playable audio stream available" }
+        }
         throw IOException("Unable to play track ($summary)")
     }
 
@@ -681,6 +717,9 @@ class YtMusicClient {
     )
 
     private fun probeStreamUrl(info: YtStreamInfo): ProbeOutcome {
+        val isGoogleVideo = info.url.contains("googlevideo.com", ignoreCase = true)
+        val probeClient = if (isGoogleVideo) apiClient else proxyClient
+
         // HLS (.m3u8) manifests do not support arbitrary byte-range probes; verify HTTP 200 + #EXTM3U header
         if (info.isHls) {
             return runCatching {
@@ -694,7 +733,7 @@ class YtMusicClient {
                         reqBuilder.header(k, v)
                     }
                 }
-                apiClient.newCall(reqBuilder.build()).execute().use { res ->
+                probeClient.newCall(reqBuilder.build()).execute().use { res ->
                     val ct = res.header("Content-Type").orEmpty()
                     val bodyPreview = res.body?.string().orEmpty().take(512)
                     val validM3u = res.code in 200..299 && bodyPreview.contains("#EXTM3U", ignoreCase = true)
@@ -715,8 +754,6 @@ class YtMusicClient {
                 )
             }
         }
-
-        val isGoogleVideo = info.url.contains("googlevideo.com", ignoreCase = true)
 
         fun executeSlice(
             start: Long,
@@ -744,7 +781,7 @@ class YtMusicClient {
                     reqBuilder.header(k, v)
                 }
             }
-            return apiClient.newCall(reqBuilder.build()).execute().use { res ->
+            return probeClient.newCall(reqBuilder.build()).execute().use { res ->
                 val okCode = res.code == 200 || res.code == 206
                 val contentType = res.header("Content-Type").orEmpty()
                 val contentRange = res.header("Content-Range").orEmpty()
@@ -752,12 +789,13 @@ class YtMusicClient {
                     ?: io.github.augztn.pocketlink.ssdbridge.ChunkedYoutubeDataSource.extractClenFromUrl(info.url)
                     ?: res.header("Content-Length")?.toLongOrNull()
                     ?: -1L
-                val isHtmlError = contentType.contains("text/html", ignoreCase = true)
-                Triple(okCode && !isHtmlError, res.code, contentType to totalBytes)
+                val isHtmlOrJsonError = contentType.contains("text/html", ignoreCase = true) ||
+                    contentType.contains("application/json", ignoreCase = true)
+                Triple(okCode && !isHtmlOrJsonError, res.code, contentType to totalBytes)
             }
         }
 
-        fun probeTwoChunks(useQueryMode: Boolean): ProbeOutcome {
+        fun probeTwoChunks(useQueryMode: Boolean, requireSecondChunkPast1MiB: Boolean): ProbeOutcome {
             val modeTag = if (useQueryMode) "query(&range=)" else "header(Range:)"
             val (ok1, code1, meta1) = executeSlice(0L, 16_383L, seq = 1, useQueryMode = useQueryMode)
             val (contentType1, totalBytes) = meta1
@@ -770,19 +808,21 @@ class YtMusicClient {
                     useQueryRange = useQueryMode,
                 )
             }
-            // Probe strictly past YouTube's 1 MiB (1,048,576 byte) 403 wall so seeking & playback past 60s are guaranteed
-            val secondStart = computeSecondProbeOffset(totalBytes)
-            if (secondStart > 0L) {
-                val secondEnd = minOf(secondStart + 2047L, totalBytes - 1L)
-                val (ok2, code2, meta2) = executeSlice(secondStart, secondEnd, seq = 2, useQueryMode = useQueryMode)
-                if (!ok2) {
-                    return ProbeOutcome(
-                        ok = false,
-                        httpStatus = code2,
-                        contentType = meta2.first,
-                        note = "Chunk 2 @${secondStart / 1024}KB HTTP $code2 ($modeTag)",
-                        useQueryRange = useQueryMode,
-                    )
+            // Only enforce the >1 MiB second-chunk check on googlevideo.com CDNs (Piped/Invidious proxies may stream HTTP 200)
+            if (requireSecondChunkPast1MiB) {
+                val secondStart = computeSecondProbeOffset(totalBytes)
+                if (secondStart > 0L) {
+                    val secondEnd = minOf(secondStart + 2047L, totalBytes - 1L)
+                    val (ok2, code2, meta2) = executeSlice(secondStart, secondEnd, seq = 2, useQueryMode = useQueryMode)
+                    if (!ok2) {
+                        return ProbeOutcome(
+                            ok = false,
+                            httpStatus = code2,
+                            contentType = meta2.first,
+                            note = "Chunk 2 @${secondStart / 1024}KB HTTP $code2 ($modeTag)",
+                            useQueryRange = useQueryMode,
+                        )
+                    }
                 }
             }
             return ProbeOutcome(
@@ -797,13 +837,13 @@ class YtMusicClient {
         return runCatching {
             if (isGoogleVideo) {
                 // InnerTune / NewPipe / YouTube VR native mode: try &range= query param first, then HTTP Range header
-                val queryRes = probeTwoChunks(useQueryMode = true)
+                val queryRes = probeTwoChunks(useQueryMode = true, requireSecondChunkPast1MiB = true)
                 if (queryRes.ok) return@runCatching queryRes
-                val headerRes = probeTwoChunks(useQueryMode = false)
+                val headerRes = probeTwoChunks(useQueryMode = false, requireSecondChunkPast1MiB = true)
                 if (headerRes.ok) return@runCatching headerRes
                 headerRes
             } else {
-                probeTwoChunks(useQueryMode = false)
+                probeTwoChunks(useQueryMode = false, requireSecondChunkPast1MiB = false)
             }
         }.getOrElse { err ->
             ProbeOutcome(
@@ -821,45 +861,111 @@ class YtMusicClient {
      */
     private fun validateStreamUrl(info: YtStreamInfo): Boolean = probeStreamUrl(info).ok
 
-    private fun resolveViaPipedOrInvidious(videoId: String, quality: YtAudioQuality): YtStreamInfo? {
-        for (base in PIPED_FALLBACK_INSTANCES) {
-            val stream = runCatching {
+    private fun refreshPublicProxyInstancesIfStale() {
+        val now = System.currentTimeMillis()
+        if (now - lastProxyDiscoveryAtMs < TimeUnit.MINUTES.toMillis(30)) return
+        lastProxyDiscoveryAtMs = now
+
+        // 1. Official live healthy Invidious API directory
+        runCatching {
+            val req = Request.Builder()
+                .url("https://api.invidious.io/instances.json?sort_by=type,health")
+                .header("User-Agent", NewPipeOkHttpDownloader.BROWSER_USER_AGENT)
+                .get()
+                .build()
+            val raw = proxyClient.newCall(req).execute().use { res ->
+                if (!res.isSuccessful) "" else res.body?.string().orEmpty()
+            }
+            if (raw.startsWith("[")) {
+                val parsed = parseInvidiousInstancesJson(raw)
+                if (parsed.isNotEmpty()) discoveredInvidiousHosts = parsed
+            }
+        }
+
+        // 2. Official live Piped API directory
+        runCatching {
+            val req = Request.Builder()
+                .url("https://piped-instances.kavin.rocks/")
+                .header("User-Agent", NewPipeOkHttpDownloader.BROWSER_USER_AGENT)
+                .get()
+                .build()
+            val raw = proxyClient.newCall(req).execute().use { res ->
+                if (!res.isSuccessful) "" else res.body?.string().orEmpty()
+            }
+            if (raw.startsWith("[")) {
+                val parsed = parsePipedInstancesJson(raw)
+                if (parsed.isNotEmpty()) discoveredPipedHosts = parsed
+            }
+        }
+    }
+
+    private fun resolveViaPipedOrInvidious(
+        videoId: String,
+        quality: YtAudioQuality,
+        probe: (YtStreamInfo) -> YtStreamInfo?,
+        errors: MutableList<String>,
+    ): YtStreamInfo? {
+        refreshPublicProxyInstancesIfStale()
+
+        val invidiousPool = buildList {
+            lastWorkingInvidiousHost?.let(::add)
+            addAll(discoveredInvidiousHosts)
+            addAll(INVIDIOUS_FALLBACK_INSTANCES)
+        }.map { it.trimEnd('/') }.distinct().take(6)
+
+        for (base in invidiousPool) {
+            val candidates = runCatching {
+                val req = Request.Builder()
+                    .url("$base/api/v1/videos/$videoId?fields=adaptiveFormats,formatStreams,hlsUrl")
+                    .header("User-Agent", NewPipeOkHttpDownloader.BROWSER_USER_AGENT)
+                    .get()
+                    .build()
+                val raw = proxyClient.newCall(req).execute().use { res ->
+                    if (!res.isSuccessful) return@runCatching emptyList()
+                    res.body?.string().orEmpty()
+                }
+                if (raw.isBlank() || !raw.trimStart().startsWith("{")) return@runCatching emptyList()
+                selectOrderedInvidiousAudioStreams(JSONObject(raw), base, videoId, quality)
+            }.getOrDefault(emptyList())
+
+            for (cand in candidates.take(4)) {
+                probe(cand)?.let { winner ->
+                    lastWorkingInvidiousHost = base
+                    return winner
+                }
+            }
+        }
+
+        val pipedPool = buildList {
+            lastWorkingPipedHost?.let(::add)
+            addAll(discoveredPipedHosts)
+            addAll(PIPED_FALLBACK_INSTANCES)
+        }.map { it.trimEnd('/') }.distinct().take(6)
+
+        for (base in pipedPool) {
+            val candidates = runCatching {
                 val req = Request.Builder()
                     .url("$base/streams/$videoId")
                     .header("User-Agent", NewPipeOkHttpDownloader.BROWSER_USER_AGENT)
                     .get()
                     .build()
-                val raw = apiClient.newCall(req).execute().use { res ->
-                    if (!res.isSuccessful) return@runCatching null
+                val raw = proxyClient.newCall(req).execute().use { res ->
+                    if (!res.isSuccessful) return@runCatching emptyList()
                     res.body?.string().orEmpty()
                 }
-                if (raw.isBlank()) return@runCatching null
-                val json = JSONObject(raw)
-                val selected = selectBestPipedAudioStream(json, quality, "Piped")
-                if (selected != null && validateStreamUrl(selected)) selected else null
-            }.getOrNull()
-            if (stream != null) return stream
-        }
+                if (raw.isBlank() || !raw.trimStart().startsWith("{")) return@runCatching emptyList()
+                selectOrderedPipedAudioStreams(JSONObject(raw), quality, "Piped")
+            }.getOrDefault(emptyList())
 
-        for (base in INVIDIOUS_FALLBACK_INSTANCES) {
-            val stream = runCatching {
-                val req = Request.Builder()
-                    .url("$base/api/v1/videos/$videoId?fields=adaptiveFormats")
-                    .header("User-Agent", NewPipeOkHttpDownloader.BROWSER_USER_AGENT)
-                    .get()
-                    .build()
-                val raw = apiClient.newCall(req).execute().use { res ->
-                    if (!res.isSuccessful) return@runCatching null
-                    res.body?.string().orEmpty()
+            for (cand in candidates.take(4)) {
+                probe(cand)?.let { winner ->
+                    lastWorkingPipedHost = base
+                    return winner
                 }
-                if (raw.isBlank()) return@runCatching null
-                val json = JSONObject(raw)
-                val selected = selectBestInvidiousAudioStream(json, base, videoId, quality)
-                if (selected != null && validateStreamUrl(selected)) selected else null
-            }.getOrNull()
-            if (stream != null) return stream
+            }
         }
 
+        errors.add("Public proxy failover (Invidious ${invidiousPool.size} / Piped ${pipedPool.size}): no playable stream")
         return null
     }
 
@@ -1112,14 +1218,31 @@ class YtMusicClient {
 
         private val PIPED_FALLBACK_INSTANCES = listOf(
             "https://pipedapi.kavin.rocks",
+            "https://pipedapi-libre.kavin.rocks",
+            "https://pipedapi.leptons.xyz",
             "https://pipedapi.adminforge.de",
+            "https://api.piped.yt",
             "https://api.piped.private.coffee",
+            "https://piped-api.privacy.com.de",
         )
 
         private val INVIDIOUS_FALLBACK_INSTANCES = listOf(
             "https://inv.nadeko.net",
+            "https://inv.thepixora.com",
+            "https://inv.perditum.com",
             "https://yewtu.be",
             "https://invidious.nerdvpn.de",
+        )
+
+        private val CLIENT_WEB_EMBEDDED = InnertubePlayerClient(
+            id = "WEB_EMBEDDED",
+            clientName = "WEB_EMBEDDED_PLAYER",
+            clientVersion = "1.20250317.01.00",
+            clientHeaderId = "56",
+            userAgent = WEB_USER_AGENT,
+            embedUrl = "https://www.youtube.com/",
+            isWebClient = true,
+            useVisitorData = false,
         )
 
         private val CLIENT_VISIONOS = InnertubePlayerClient(
@@ -1132,6 +1255,7 @@ class YtMusicClient {
             osVersion = "26.5.23O471",
             deviceMake = "Apple",
             deviceModel = "RealityDevice17,1",
+            useVisitorData = false,
         )
 
         private val CLIENT_ANDROID_VR_171 = InnertubePlayerClient(
@@ -1145,6 +1269,7 @@ class YtMusicClient {
             deviceMake = "Oculus",
             deviceModel = "Quest 3",
             androidSdkVersion = 32,
+            useVisitorData = false,
         )
 
         private val CLIENT_ANDROID_VR_161 = InnertubePlayerClient(
@@ -1158,6 +1283,7 @@ class YtMusicClient {
             deviceMake = "Oculus",
             deviceModel = "Quest 3",
             androidSdkVersion = 32,
+            useVisitorData = false,
         )
 
         private val CLIENT_ANDROID_VR_165 = InnertubePlayerClient(
@@ -1171,6 +1297,7 @@ class YtMusicClient {
             deviceMake = "Oculus",
             deviceModel = "Quest 3",
             androidSdkVersion = 32,
+            useVisitorData = false,
         )
 
         private val CLIENT_ANDROID_VR_143 = InnertubePlayerClient(
@@ -1184,37 +1311,30 @@ class YtMusicClient {
             deviceMake = "Oculus",
             deviceModel = "Quest 3",
             androidSdkVersion = 32,
+            useVisitorData = false,
         )
 
         private val CLIENT_TVHTML5 = InnertubePlayerClient(
             id = "TVHTML5",
             clientName = "TVHTML5",
-            clientVersion = "7.20250319.10.00",
+            clientVersion = "7.20260215.10.00",
             clientHeaderId = "7",
             userAgent = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
             isWebClient = true,
+            useVisitorData = false,
         )
 
         private val CLIENT_IOS = InnertubePlayerClient(
             id = "IOS",
             clientName = "IOS",
-            clientVersion = "20.10.4",
+            clientVersion = "20.49.4",
             clientHeaderId = "5",
-            userAgent = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+            userAgent = "com.google.ios.youtube/20.49.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
             osName = "iPhone",
             osVersion = "18.3.2.22D82",
             deviceMake = "Apple",
             deviceModel = "iPhone16,2",
-        )
-
-        private val CLIENT_TV_EMBED = InnertubePlayerClient(
-            id = "TV_EMBED",
-            clientName = "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-            clientVersion = "2.0",
-            clientHeaderId = "85",
-            userAgent = "Mozilla/5.0 (PlayStation; PlayStation 4/12.02) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Safari/605.1.15",
-            embedUrl = "https://www.youtube.com",
-            isWebClient = true,
+            useVisitorData = false,
         )
 
         private val CLIENT_ANDROID_TESTSUITE = InnertubePlayerClient(
@@ -1226,6 +1346,7 @@ class YtMusicClient {
             osName = "Android",
             osVersion = "14",
             androidSdkVersion = 34,
+            useVisitorData = false,
         )
 
         private val CLIENT_ANDROID_MUSIC = InnertubePlayerClient(
@@ -1238,6 +1359,7 @@ class YtMusicClient {
             osName = "Android",
             osVersion = "14",
             androidSdkVersion = 34,
+            useVisitorData = true,
         )
 
         internal fun computeSecondProbeOffset(totalBytes: Long): Long = when {
@@ -1251,12 +1373,12 @@ class YtMusicClient {
             "IOS" -> listOf(
                 CLIENT_VISIONOS,
                 CLIENT_IOS,
+                CLIENT_WEB_EMBEDDED,
                 CLIENT_ANDROID_VR_171,
                 CLIENT_ANDROID_VR_165,
                 CLIENT_ANDROID_VR_143,
                 CLIENT_ANDROID_VR_161,
                 CLIENT_TVHTML5,
-                CLIENT_TV_EMBED,
                 CLIENT_ANDROID_MUSIC,
                 CLIENT_ANDROID_TESTSUITE,
             )
@@ -1264,26 +1386,26 @@ class YtMusicClient {
                 CLIENT_ANDROID_VR_171,
                 CLIENT_ANDROID_VR_165,
                 CLIENT_VISIONOS,
+                CLIENT_WEB_EMBEDDED,
                 CLIENT_ANDROID_VR_143,
                 CLIENT_ANDROID_VR_161,
                 CLIENT_TVHTML5,
-                CLIENT_TV_EMBED,
                 CLIENT_ANDROID_MUSIC,
                 CLIENT_ANDROID_TESTSUITE,
                 CLIENT_IOS,
             )
             else -> listOf(
-                // yt-dlp / OuterTune / Metrolist 2025-2026 rotation: bypasses 1 MiB 403 cap with VISIONOS + VR 1.71 + HLS
+                // Multi-family rotation: VR + VisionOS + Embedded Web + TV + iOS (no cross-client visitorData poisoning)
                 CLIENT_ANDROID_VR_171,
                 CLIENT_VISIONOS,
+                CLIENT_WEB_EMBEDDED,
                 CLIENT_ANDROID_VR_165,
+                CLIENT_TVHTML5,
+                CLIENT_IOS,
                 CLIENT_ANDROID_VR_143,
                 CLIENT_ANDROID_VR_161,
-                CLIENT_TVHTML5,
-                CLIENT_TV_EMBED,
                 CLIENT_ANDROID_MUSIC,
                 CLIENT_ANDROID_TESTSUITE,
-                CLIENT_IOS,
             )
         }
 
@@ -1476,46 +1598,214 @@ class YtMusicClient {
             isUnmeteredNetwork = isUnmeteredNetwork,
         ).firstOrNull()
 
-        internal fun selectBestPipedAudioStream(
+        internal fun parseInvidiousInstancesJson(rawJson: String): List<String> = runCatching {
+            val arr = JSONArray(rawJson)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val entry = arr.optJSONArray(i) ?: continue
+                    val meta = entry.optJSONObject(1) ?: continue
+                    if (!meta.optString("type").equals("https", ignoreCase = true)) continue
+                    if (!meta.optBoolean("api", false)) continue
+                    val uri = meta.optString("uri").trim().trimEnd('/')
+                    if (uri.startsWith("https://", ignoreCase = true)) {
+                        add(uri)
+                    }
+                }
+            }.distinct()
+        }.getOrDefault(emptyList())
+
+        internal fun parsePipedInstancesJson(rawJson: String): List<String> = runCatching {
+            val arr = JSONArray(rawJson)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val apiUrl = obj.optString("api_url").trim().trimEnd('/')
+                    if (apiUrl.startsWith("https://", ignoreCase = true)) {
+                        add(apiUrl)
+                    }
+                }
+            }.distinct()
+        }.getOrDefault(emptyList())
+
+        internal fun selectOrderedPipedAudioStreams(
             pipedJson: JSONObject,
             quality: YtAudioQuality,
             clientName: String,
             isUnmeteredNetwork: Boolean = true,
-        ): YtStreamInfo? {
-            val arr = pipedJson.optJSONArray("audioStreams") ?: return null
+        ): List<YtStreamInfo> {
+            val arr = pipedJson.optJSONArray("audioStreams")
             data class Candidate(val url: String, val mime: String, val bitrate: Long, val itag: Int?)
             val pool = buildList {
-                for (i in 0 until arr.length()) {
-                    val o = arr.optJSONObject(i) ?: continue
-                    val url = o.optString("url").trim()
-                    if (url.isEmpty()) continue
-                    val mime = o.optString("mimeType").trim().ifBlank { "audio/webm" }
-                    val bitrate = o.optLong("bitrate", 128_000L)
-                    val itag = o.optInt("itag", 0).takeIf { it > 0 }
-                    add(Candidate(url, mime, bitrate, itag))
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val url = o.optString("url").trim()
+                        if (url.isEmpty()) continue
+                        val mime = o.optString("mimeType").trim().ifBlank { "audio/webm" }
+                        val bitrate = o.optLong("bitrate", 128_000L)
+                        val itag = o.optInt("itag", 0).takeIf { it > 0 }
+                        add(Candidate(url, mime, bitrate, itag))
+                    }
                 }
             }
-            if (pool.isEmpty()) return null
             val resolvedQuality = resolveEffectiveQuality(quality, isUnmeteredNetwork)
-            val chosen = orderCandidatesOpusFirst(
+            val ordered = orderCandidatesOpusFirst(
                 pool = pool,
                 resolvedQuality = resolvedQuality,
                 mimeOf = { it.mime },
                 bitrateOf = { it.bitrate },
                 itagOf = { it.itag },
-            ).firstOrNull() ?: return null
+            ).map { chosen ->
+                YtStreamInfo(
+                    url = chosen.url,
+                    mimeType = chosen.mime,
+                    bitrateBps = chosen.bitrate,
+                    clientName = clientName,
+                    expiresAtMs = extractExpireEpochMs(chosen.url)
+                        ?: (System.currentTimeMillis() + TimeUnit.HOURS.toMillis(2)),
+                    userAgent = NewPipeOkHttpDownloader.BROWSER_USER_AGENT,
+                    codecLabel = if (isOpusMimeOrItag(chosen.mime, chosen.itag)) "OPUS" else "",
+                    itag = chosen.itag,
+                )
+            }.toMutableList()
 
-            return YtStreamInfo(
-                url = chosen.url,
-                mimeType = chosen.mime,
-                bitrateBps = chosen.bitrate,
-                clientName = clientName,
-                expiresAtMs = extractExpireEpochMs(chosen.url)
-                    ?: (System.currentTimeMillis() + TimeUnit.HOURS.toMillis(2)),
-                userAgent = NewPipeOkHttpDownloader.BROWSER_USER_AGENT,
-                codecLabel = if (isOpusMimeOrItag(chosen.mime, chosen.itag)) "OPUS" else "",
-                itag = chosen.itag,
+            val hlsUrl = pipedJson.optString("hls").trim()
+            if (hlsUrl.startsWith("https://", ignoreCase = true) || hlsUrl.startsWith("http://", ignoreCase = true)) {
+                ordered.add(
+                    YtStreamInfo(
+                        url = hlsUrl,
+                        mimeType = "application/x-mpegURL",
+                        bitrateBps = 128_000L,
+                        clientName = clientName,
+                        expiresAtMs = System.currentTimeMillis() + TimeUnit.HOURS.toMillis(2),
+                        userAgent = NewPipeOkHttpDownloader.BROWSER_USER_AGENT,
+                        codecLabel = "HLS",
+                        itag = null,
+                    )
+                )
+            }
+            return ordered
+        }
+
+        internal fun selectBestPipedAudioStream(
+            pipedJson: JSONObject,
+            quality: YtAudioQuality,
+            clientName: String,
+            isUnmeteredNetwork: Boolean = true,
+        ): YtStreamInfo? = selectOrderedPipedAudioStreams(
+            pipedJson = pipedJson,
+            quality = quality,
+            clientName = clientName,
+            isUnmeteredNetwork = isUnmeteredNetwork,
+        ).firstOrNull()
+
+        internal fun selectOrderedInvidiousAudioStreams(
+            invidiousJson: JSONObject,
+            instanceBaseUrl: String,
+            videoId: String,
+            quality: YtAudioQuality,
+            isUnmeteredNetwork: Boolean = true,
+        ): List<YtStreamInfo> {
+            val cleanBase = instanceBaseUrl.trimEnd('/')
+            data class Candidate(val url: String, val mime: String, val bitrate: Long, val itag: Int?, val proxied: Boolean)
+
+            fun collect(arr: JSONArray?, audioOnly: Boolean): List<Candidate> {
+                if (arr == null) return emptyList()
+                return buildList {
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val type = o.optString("type").trim()
+                        if (audioOnly && !type.startsWith("audio/", ignoreCase = true)) continue
+                        val itagStr = o.optString("itag").trim()
+                        val itagInt = itagStr.toIntOrNull()
+                        val rawUrl = o.optString("url").trim()
+                        val bitrate = o.optString("bitrate").toLongOrNull()
+                            ?: o.optLong("bitrate", 128_000L)
+                        // Add instance-proxied local=true first (bypasses datacenter IP blocks on googlevideo.com)
+                        if (itagStr.isNotEmpty()) {
+                            add(
+                                Candidate(
+                                    url = "$cleanBase/latest_version?id=$videoId&itag=$itagStr&local=true",
+                                    mime = type.ifBlank { "audio/webm" },
+                                    bitrate = bitrate,
+                                    itag = itagInt,
+                                    proxied = true,
+                                )
+                            )
+                        }
+                        // Also add direct rawUrl fallback if instance disables local=true proxying
+                        if (rawUrl.startsWith("http://", ignoreCase = true) || rawUrl.startsWith("https://", ignoreCase = true)) {
+                            add(
+                                Candidate(
+                                    url = rawUrl,
+                                    mime = type.ifBlank { "audio/webm" },
+                                    bitrate = bitrate,
+                                    itag = itagInt,
+                                    proxied = false,
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+
+            val adaptive = collect(invidiousJson.optJSONArray("adaptiveFormats"), audioOnly = true)
+            val progressive = collect(invidiousJson.optJSONArray("formatStreams"), audioOnly = false)
+            val resolvedQuality = resolveEffectiveQuality(quality, isUnmeteredNetwork)
+
+            val (proxiedAdaptive, directAdaptive) = adaptive.partition { it.proxied }
+            val orderedProxied = orderCandidatesOpusFirst(
+                pool = proxiedAdaptive,
+                resolvedQuality = resolvedQuality,
+                mimeOf = { it.mime },
+                bitrateOf = { it.bitrate },
+                itagOf = { it.itag },
             )
+            val orderedDirect = orderCandidatesOpusFirst(
+                pool = directAdaptive,
+                resolvedQuality = resolvedQuality,
+                mimeOf = { it.mime },
+                bitrateOf = { it.bitrate },
+                itagOf = { it.itag },
+            )
+            val combined = (orderedProxied + progressive.filter { it.proxied } + orderedDirect + progressive.filterNot { it.proxied })
+                .distinctBy { it.url }
+
+            val out = combined.map { chosen ->
+                val isOpus = isOpusMimeOrItag(chosen.mime, chosen.itag)
+                YtStreamInfo(
+                    url = chosen.url,
+                    mimeType = chosen.mime,
+                    bitrateBps = chosen.bitrate,
+                    clientName = "Invidious",
+                    expiresAtMs = extractExpireEpochMs(chosen.url)
+                        ?: (System.currentTimeMillis() + TimeUnit.HOURS.toMillis(2)),
+                    userAgent = NewPipeOkHttpDownloader.BROWSER_USER_AGENT,
+                    codecLabel = when {
+                        isOpus -> "OPUS"
+                        chosen.mime.startsWith("video/mp4", ignoreCase = true) -> "MP4"
+                        else -> ""
+                    },
+                    itag = chosen.itag,
+                )
+            }.toMutableList()
+
+            val hlsUrl = invidiousJson.optString("hlsUrl").trim()
+            if (hlsUrl.startsWith("https://", ignoreCase = true) || hlsUrl.startsWith("http://", ignoreCase = true)) {
+                out.add(
+                    YtStreamInfo(
+                        url = hlsUrl,
+                        mimeType = "application/x-mpegURL",
+                        bitrateBps = 128_000L,
+                        clientName = "Invidious",
+                        expiresAtMs = System.currentTimeMillis() + TimeUnit.HOURS.toMillis(2),
+                        userAgent = NewPipeOkHttpDownloader.BROWSER_USER_AGENT,
+                        codecLabel = "HLS",
+                        itag = null,
+                    )
+                )
+            }
+            return out
         }
 
         internal fun selectBestInvidiousAudioStream(
@@ -1524,50 +1814,13 @@ class YtMusicClient {
             videoId: String,
             quality: YtAudioQuality,
             isUnmeteredNetwork: Boolean = true,
-        ): YtStreamInfo? {
-            val arr = invidiousJson.optJSONArray("adaptiveFormats") ?: return null
-            data class Candidate(val url: String, val mime: String, val bitrate: Long, val itag: Int?)
-            val pool = buildList {
-                for (i in 0 until arr.length()) {
-                    val o = arr.optJSONObject(i) ?: continue
-                    val type = o.optString("type").trim()
-                    if (!type.startsWith("audio/", ignoreCase = true)) continue
-                    val itagStr = o.optString("itag").trim()
-                    val itagInt = itagStr.toIntOrNull()
-                    val rawUrl = o.optString("url").trim()
-                    // Prefer instance-proxied local=true endpoint when itag is present so datacenter IPs bypass googlevideo blocks
-                    val finalUrl = if (itagStr.isNotEmpty()) {
-                        "${instanceBaseUrl.trimEnd('/')}/latest_version?id=$videoId&itag=$itagStr&local=true"
-                    } else if (rawUrl.isNotEmpty()) {
-                        rawUrl
-                    } else {
-                        continue
-                    }
-                    val bitrate = o.optString("bitrate").toLongOrNull() ?: o.optLong("bitrate", 128_000L)
-                    add(Candidate(finalUrl, type, bitrate, itagInt))
-                }
-            }
-            if (pool.isEmpty()) return null
-            val resolvedQuality = resolveEffectiveQuality(quality, isUnmeteredNetwork)
-            val chosen = orderCandidatesOpusFirst(
-                pool = pool,
-                resolvedQuality = resolvedQuality,
-                mimeOf = { it.mime },
-                bitrateOf = { it.bitrate },
-                itagOf = { it.itag },
-            ).firstOrNull() ?: return null
-
-            return YtStreamInfo(
-                url = chosen.url,
-                mimeType = chosen.mime,
-                bitrateBps = chosen.bitrate,
-                clientName = "Invidious",
-                expiresAtMs = System.currentTimeMillis() + TimeUnit.HOURS.toMillis(2),
-                userAgent = NewPipeOkHttpDownloader.BROWSER_USER_AGENT,
-                codecLabel = if (isOpusMimeOrItag(chosen.mime, chosen.itag)) "OPUS" else "",
-                itag = chosen.itag,
-            )
-        }
+        ): YtStreamInfo? = selectOrderedInvidiousAudioStreams(
+            invidiousJson = invidiousJson,
+            instanceBaseUrl = instanceBaseUrl,
+            videoId = videoId,
+            quality = quality,
+            isUnmeteredNetwork = isUnmeteredNetwork,
+        ).firstOrNull()
 
         internal fun extractExpireEpochMs(url: String): Long? {
             val match = Regex("[?&]expire=(\\d+)").find(url) ?: return null
