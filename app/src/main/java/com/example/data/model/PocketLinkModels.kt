@@ -255,6 +255,7 @@ data class AppSettingsState(
     val themeMode: AppThemeMode = AppThemeMode.DARK,
     val amoled: Boolean = false,
     val useLiquidGlass: Boolean = true,
+    val headerBlurEnabled: Boolean = true,
     val navigationOrder: List<String> = DEFAULT_NAVIGATION_ORDER,
     val visibleNavigationItems: Set<String> = DEFAULT_NAVIGATION_ORDER.toSet(),
     val quickActions: List<String> = DEFAULT_QUICK_ACTIONS,

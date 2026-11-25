@@ -105,6 +105,7 @@ fun CloudflareTunnelCard(
     tunnelStatus: TunnelStatusSnapshot,
     tunnelConfig: CloudflareTunnelConfig,
     hostRunning: Boolean,
+    onConnectCloudflare: (() -> Unit)? = null,
     onMessage: (String) -> Unit,
 ) {
     val context = LocalContext.current
@@ -121,7 +122,7 @@ fun CloudflareTunnelCard(
     var revealZeroTrustToken by remember { mutableStateOf(false) }
 
     var verifying by remember { mutableStateOf(false) }
-    var showConfigSection by rememberSaveable { mutableStateOf(!tunnelConfig.isReadyToStart) }
+    var showConfigSection by rememberSaveable { mutableStateOf(false) }
     var showWorkerGuide by rememberSaveable { mutableStateOf(false) }
     var showLogs by rememberSaveable { mutableStateOf(false) }
 
@@ -171,7 +172,7 @@ fun CloudflareTunnelCard(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            // Header row: Cloudflare badge + status pill
+            // Header row: Cloudflare badge + status pill + 1-click toggle
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -206,7 +207,7 @@ fun CloudflareTunnelCard(
                             shape = RoundedCornerShape(99.dp),
                         ) {
                             Text(
-                                text = "HTTPS",
+                                text = "1-CLICK AUTO",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = cfColor,
                                 fontWeight = FontWeight.Bold,
@@ -215,7 +216,7 @@ fun CloudflareTunnelCard(
                         }
                     }
                     Text(
-                        text = "Remote HTTPS access · More providers coming soon",
+                        text = "Zero setup · Auto-handles credentials, password & HTTPS URL",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -251,29 +252,14 @@ fun CloudflareTunnelCard(
                             viewModel.stopCloudflareTunnel()
                             onMessage("Cloudflare Tunnel turned off")
                         } else {
-                            persistCurrentInputs()
-                                .onSuccess { cfg ->
-                                    if (!cfg.isReadyToStart) {
-                                        showConfigSection = true
-                                        onMessage("Enter your Cloudflare URL & secret below, then toggle ON")
-                                    } else {
-                                        viewModel.startCloudflareTunnel()
-                                            .onSuccess {
-                                                showConfigSection = false
-                                                onMessage(
-                                                    if (!hostRunning) "Starting Host Server & Cloudflare Tunnel…"
-                                                    else "Starting Cloudflare Tunnel…"
-                                                )
-                                            }
-                                            .onFailure { err ->
-                                                showConfigSection = true
-                                                onMessage(err.message ?: "Could not start Cloudflare Tunnel")
-                                            }
-                                    }
+                            runCatching { persistCurrentInputs() }
+                            viewModel.startCloudflareTunnel()
+                                .onSuccess {
+                                    showConfigSection = false
+                                    onMessage("Cloudflare Tunnel is live — no manual setup needed")
                                 }
                                 .onFailure { err ->
-                                    showConfigSection = true
-                                    onMessage(err.message ?: "Enter Cloudflare URL & secret below")
+                                    onMessage(err.message ?: "Could not start Cloudflare Tunnel")
                                 }
                         }
                     },
@@ -281,7 +267,7 @@ fun CloudflareTunnelCard(
                 )
             }
 
-            // Live Public URL pill + telemetry when active or configured
+            // Live Public URL pill + telemetry + 1-Tap Connect & 1-Tap Invite Link
             val activeUrl = tunnelStatus.publicUrl?.takeIf { it.isNotBlank() }
                 ?: tunnelConfig.activePublicUrl.takeIf { it.isNotBlank() }
             if (!activeUrl.isNullOrBlank()) {
@@ -299,7 +285,7 @@ fun CloudflareTunnelCard(
                 ) {
                     Column(
                         modifier = Modifier.padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -330,26 +316,13 @@ fun CloudflareTunnelCard(
                             ) {
                                 Icon(Icons.Rounded.ContentCopy, contentDescription = "Copy Cloudflare URL", modifier = Modifier.size(18.dp))
                             }
-                            IconButton(
-                                onClick = {
-                                    val share = Intent(Intent.ACTION_SEND).apply {
-                                        type = "text/plain"
-                                        putExtra(Intent.EXTRA_SUBJECT, "PocketLink Cloudflare Server")
-                                        putExtra(Intent.EXTRA_TEXT, activeUrl)
-                                    }
-                                    runCatching { context.startActivity(Intent.createChooser(share, "Share Cloudflare URL")) }
-                                },
-                                modifier = Modifier.size(40.dp),
-                            ) {
-                                Icon(Icons.Rounded.Share, contentDescription = "Share Cloudflare URL", modifier = Modifier.size(18.dp))
-                            }
                         }
 
                         // Telemetry badges (CF-Ray, Latency, Proxied Requests & Bytes)
                         val telemetry = buildList {
                             tunnelStatus.cloudflareRay?.takeIf { it.isNotBlank() }?.let { add("CF-Ray $it") }
                             tunnelStatus.latencyMs?.let { add("${it} ms") }
-                            if (tunnelStatus.mode == CloudflareTunnelMode.EDGE_BRIDGE && tunnelStatus.requestsProxied > 0) {
+                            if (tunnelStatus.requestsProxied > 0) {
                                 add("${tunnelStatus.requestsProxied} req · ${formatBytes(tunnelStatus.bytesProxied)}")
                             }
                             if (tunnelStatus.state == TunnelState.CONNECTED) {
@@ -364,20 +337,39 @@ fun CloudflareTunnelCard(
                             )
                         }
 
-                        // One-tap Client Connect Link (paste directly on any client phone)
+                        // Primary 1-Tap Connect on This Device button
+                        if (onConnectCloudflare != null) {
+                            Button(
+                                onClick = { onConnectCloudflare() },
+                                colors = ButtonDefaults.buttonColors(containerColor = cfColor, contentColor = Color.White),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(46.dp)
+                                    .testTag("cloudflare_one_tap_connect_btn"),
+                            ) {
+                                Icon(Icons.Rounded.AutoAwesome, contentDescription = null, modifier = Modifier.size(17.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("1-Tap Connect via Cloudflare Now", fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        // One-tap Client Invite Link (includes URL + auto-configured password!)
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            val connectLink = buildPocketLinkConnectUri(
-                                publicUrl = activeUrl,
-                                username = "admin",
-                                serverName = "PocketLink Cloud",
-                            )
                             FilledTonalButton(
                                 onClick = {
-                                    copyTunnelClipboard(context, "PocketLink Client Connect Link", connectLink)
-                                    onMessage("Copied Client Connect Link — tap Paste Link on your other phone")
+                                    val hostPwd = viewModel.resolveLocalHostPassword()
+                                    val connectLink = buildPocketLinkConnectUri(
+                                        publicUrl = activeUrl,
+                                        username = "admin",
+                                        serverName = "PocketLink Cloud",
+                                        password = hostPwd,
+                                    )
+                                    copyTunnelClipboard(context, "PocketLink 1-Tap Invite Link", connectLink)
+                                    onMessage("Copied 1-Tap Invite Link (includes password) — tap Paste Invite Link on your other phone")
                                 },
                                 shape = RoundedCornerShape(10.dp),
                                 modifier = Modifier
@@ -386,16 +378,23 @@ fun CloudflareTunnelCard(
                             ) {
                                 Icon(Icons.Rounded.Link, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("Copy Client Link", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                                Text("Copy 1-Tap Invite Link", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
                             }
                             OutlinedButton(
                                 onClick = {
+                                    val hostPwd = viewModel.resolveLocalHostPassword()
+                                    val connectLink = buildPocketLinkConnectUri(
+                                        publicUrl = activeUrl,
+                                        username = "admin",
+                                        serverName = "PocketLink Cloud",
+                                        password = hostPwd,
+                                    )
                                     val share = Intent(Intent.ACTION_SEND).apply {
                                         type = "text/plain"
                                         putExtra(Intent.EXTRA_SUBJECT, "Connect to PocketLink")
                                         putExtra(Intent.EXTRA_TEXT, connectLink)
                                     }
-                                    runCatching { context.startActivity(Intent.createChooser(share, "Share Client Connect Link")) }
+                                    runCatching { context.startActivity(Intent.createChooser(share, "Share 1-Tap Invite Link")) }
                                 },
                                 shape = RoundedCornerShape(10.dp),
                             ) {
@@ -408,7 +407,7 @@ fun CloudflareTunnelCard(
                 }
             }
 
-            // Collapsible configuration section (auto-collapsed once ready/active for clean mobile-server UX)
+            // Collapsible advanced configuration section (optional custom domain / Worker / Zero Trust)
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainer,
                 shape = RoundedCornerShape(14.dp),
@@ -425,7 +424,7 @@ fun CloudflareTunnelCard(
                 ) {
                     Icon(Icons.Rounded.Tune, contentDescription = null, tint = cfColor, modifier = Modifier.size(18.dp))
                     Text(
-                        text = if (tunnelConfig.isReadyToStart) "Tunnel settings (${selectedMode.shortLabel})" else "Configure Cloudflare Tunnel",
+                        text = "Advanced / Custom Domain (Optional — ${selectedMode.shortLabel})",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.weight(1f),
@@ -446,17 +445,25 @@ fun CloudflareTunnelCard(
             ) {
                 CloudflareTunnelMode.entries.forEach { mode ->
                     val selected = selectedMode == mode
-                    val tag = if (mode == CloudflareTunnelMode.EDGE_BRIDGE) "cf_mode_edge_bridge" else "cf_mode_zero_trust"
+                    val tag = when (mode) {
+                        CloudflareTunnelMode.AUTO_EDGE -> "cf_mode_auto_edge"
+                        CloudflareTunnelMode.EDGE_BRIDGE -> "cf_mode_edge_bridge"
+                        CloudflareTunnelMode.ZERO_TRUST -> "cf_mode_zero_trust"
+                    }
                     FilterChip(
                         selected = selected,
                         onClick = {
                             selectedMode = mode
                             viewModel.saveCloudflareTunnelConfig(mode = mode)
                         },
-                        label = { Text(mode.shortLabel, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium) },
+                        label = { Text(mode.shortLabel, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium) },
                         leadingIcon = {
                             Icon(
-                                imageVector = if (mode == CloudflareTunnelMode.EDGE_BRIDGE) Icons.Rounded.Cloud else Icons.Rounded.Shield,
+                                imageVector = when (mode) {
+                                    CloudflareTunnelMode.AUTO_EDGE -> Icons.Rounded.AutoAwesome
+                                    CloudflareTunnelMode.EDGE_BRIDGE -> Icons.Rounded.Cloud
+                                    CloudflareTunnelMode.ZERO_TRUST -> Icons.Rounded.Shield
+                                },
                                 contentDescription = null,
                                 modifier = Modifier.size(16.dp),
                             )
@@ -479,7 +486,39 @@ fun CloudflareTunnelCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
-            if (selectedMode == CloudflareTunnelMode.EDGE_BRIDGE) {
+            if (selectedMode == CloudflareTunnelMode.AUTO_EDGE) {
+                Surface(
+                    color = colors.emerald.copy(alpha = 0.11f),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.VerifiedUser,
+                            contentDescription = null,
+                            tint = colors.emerald,
+                            modifier = Modifier.size(20.dp),
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Automatic 1-Click Provisioning Enabled",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = colors.emerald,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Text(
+                                text = "Device credentials, tunnel token, and Cloudflare HTTPS session (${tunnelConfig.activePublicUrl.ifBlank { "auto" }}) are managed automatically — no manual typing required.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            } else if (selectedMode == CloudflareTunnelMode.EDGE_BRIDGE) {
                 OutlinedTextField(
                     value = workerUrlInput,
                     onValueChange = { workerUrlInput = it },
@@ -808,18 +847,15 @@ fun CloudflareTunnelCard(
                             viewModel.stopCloudflareTunnel()
                             onMessage("Cloudflare Tunnel stopped")
                         } else {
-                            persistCurrentInputs()
+                            runCatching { persistCurrentInputs() }
+                            viewModel.startCloudflareTunnel()
                                 .onSuccess {
-                                    viewModel.startCloudflareTunnel()
-                                        .onSuccess {
-                                            onMessage(
-                                                if (!hostRunning) "Starting Host Server & Cloudflare Tunnel…"
-                                                else "Starting Cloudflare Tunnel…"
-                                            )
-                                        }
-                                        .onFailure { err -> onMessage(err.message ?: "Could not start Cloudflare Tunnel") }
+                                    onMessage(
+                                        if (!hostRunning) "Auto-configured & starting Host Server + Cloudflare Tunnel…"
+                                        else "Auto-configured & starting Cloudflare Tunnel…"
+                                    )
                                 }
-                                .onFailure { err -> onMessage(err.message ?: "Check Cloudflare URL & secret") }
+                                .onFailure { err -> onMessage(err.message ?: "Could not start Cloudflare Tunnel") }
                         }
                     },
                     colors = if (tunnelStatus.isActive) {

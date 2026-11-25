@@ -52,22 +52,74 @@ class PocketLinkApi(
             val req = chain.request()
             if (!req.isHttps) {
                 val requestRoute = classifyNetworkRoute(req.url.toString())
-                if (requestRoute != NetworkRouteType.LOCALHOST && requestRoute != NetworkRouteType.TAILSCALE) {
+                if (requestRoute != NetworkRouteType.LOCALHOST &&
+                    requestRoute != NetworkRouteType.TAILSCALE &&
+                    requestRoute != NetworkRouteType.PRIVATE_LAN
+                ) {
                     throw IOException(
-                        "Plain HTTP is allowed only over Tailscale (100.x.y.z or *.ts.net) or localhost. " +
-                            "Open Tailscale on both devices and use the Host device's 100.x.y.z IP, or use https://."
+                        "Plain HTTP is allowed only over Tailscale (100.x.y.z), private Wi-Fi/LAN, or localhost."
                     )
                 }
             }
             val reqUrl = req.url.toString()
             val targetsThisServer = reqUrl.startsWith(baseUrl)
             val needsAuth = targetsThisServer && !req.url.encodedPath.endsWith("/health")
-            val next = if (needsAuth && req.header("Authorization") == null) {
+            val authedReq = if (needsAuth && req.header("Authorization") == null) {
                 req.newBuilder().header("Authorization", authHeader).build()
             } else {
                 req
             }
-            chain.proceed(next)
+
+            val hostLower = authedReq.url.host.lowercase()
+            val targetAutoSubdomain = io.github.augztn.pocketlink.ssdbridge.tunnel.TunnelManager
+                .extractAutoCloudflareSubdomain(hostLower)
+            val isThisDeviceOwnAutoCloudflare = targetsThisServer &&
+                io.github.augztn.pocketlink.ssdbridge.tunnel.TunnelManager.isThisDeviceAutoPublicUrl(hostLower)
+            val isRemoteAutoCloudflare = targetsThisServer &&
+                targetAutoSubdomain != null &&
+                !isThisDeviceOwnAutoCloudflare
+            val isLocalLoopback = targetsThisServer && (
+                hostLower == "127.0.0.1" || hostLower == "localhost" || hostLower == "::1"
+                )
+            val activeLocalPort = io.github.augztn.pocketlink.ssdbridge.BridgeService.activeApiPort
+                .takeIf { it > 0 } ?: 8000
+
+            if (isRemoteAutoCloudflare && targetAutoSubdomain != null) {
+                io.github.augztn.pocketlink.ssdbridge.tunnel.PocketLinkPeerBridge.executeRemoteTunnelRequest(
+                    chain = chain,
+                    authedReq = authedReq,
+                    targetSubdomain = targetAutoSubdomain,
+                )
+            } else if (isThisDeviceOwnAutoCloudflare) {
+                val bridgedUrl = authedReq.url.newBuilder()
+                    .scheme("http")
+                    .host("127.0.0.1")
+                    .port(activeLocalPort)
+                    .build()
+                val bridgedReq = authedReq.newBuilder()
+                    .url(bridgedUrl)
+                    .header("X-Forwarded-Proto", "https")
+                    .header("X-Forwarded-Host", authedReq.url.host)
+                    .header("X-PocketLink-Auto-Tunnel", "1")
+                    .build()
+                val res = chain.proceed(bridgedReq)
+                val bodyLen = res.header("Content-Length")?.toLongOrNull() ?: 512L
+                io.github.augztn.pocketlink.ssdbridge.tunnel.TunnelManager.recordTrafficIfInitialized(bodyLen)
+                res
+            } else if (isLocalLoopback && io.github.augztn.pocketlink.ssdbridge.BridgeService.apiRunning) {
+                val bridgedUrl = authedReq.url.newBuilder()
+                    .scheme("http")
+                    .host("127.0.0.1")
+                    .port(activeLocalPort)
+                    .build()
+                val bridgedReq = authedReq.newBuilder()
+                    .url(bridgedUrl)
+                    .header("X-PocketLink-Auto-Tunnel", "1")
+                    .build()
+                chain.proceed(bridgedReq)
+            } else {
+                chain.proceed(authedReq)
+            }
         }
         .build()
 

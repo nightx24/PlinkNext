@@ -8,8 +8,16 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 
-class SafHttpServer(private val context: Context, private val token: String) : NanoHTTPD("127.0.0.1", 8765) {
+class SafHttpServer(
+    private val context: Context,
+    private val token: String,
+    listenPort: Int = DEFAULT_PORT,
+) : NanoHTTPD("127.0.0.1", listenPort) {
     private val prefs = context.getSharedPreferences("ssd-bridge", Context.MODE_PRIVATE)
+
+    companion object {
+        const val DEFAULT_PORT = 8765
+    }
 
     override fun useGzipWhenAccepted(r: Response): Boolean {
         if (r.getHeader("content-range") != null || r.getHeader("accept-ranges") != null) {

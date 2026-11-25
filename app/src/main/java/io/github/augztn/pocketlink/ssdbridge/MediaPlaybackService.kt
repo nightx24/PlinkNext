@@ -326,6 +326,7 @@ internal data class ResolvedExternalStream(
     val sourceName: String = "NewPipe",
     val useQueryRange: Boolean = false,
     val isHls: Boolean = false,
+    val expiresAtMs: Long = 0L,
 )
 
 internal class HlsSwitchException(
@@ -337,15 +338,21 @@ internal class HlsSwitchException(
  * BitChord / InnerTune / NewPipe-style bounded-range chunked HTTP DataSource for googlevideo.com.
  *
  * Executes direct OkHttp bounded `Range: bytes=start-end` requests (512 KB chunks) with a single
- * clean `User-Agent` header (identical to `YtMusicClient.probeStreamUrl`), avoiding both:
- * 1) Media3 `OkHttpDataSource` duplicating `User-Agent` when present in both factory & DataSpec.
- * 2) `googlevideo.com` returning HTTP 403 on unbounded full-file GET requests for Opus streams.
+ * clean `User-Agent` header (identical to `YtMusicClient.probeStreamUrl`), plus automatic:
+ * 1) Transport mode fallback between YouTube native `&range=` query mode and HTTP `Range:` header.
+ * 2) Proactive token refresh when the `expire=` timestamp in the URL approaches expiration.
+ * 3) Mid-stream client rotation & token refresh (up to [MAX_CLIENT_ROTATIONS_PER_CHUNK] alternate
+ *    InnerTube / NewPipe clients) whenever `googlevideo.com` returns HTTP 403/401/410 on a chunk,
+ *    preserving the exact `currentPos` byte offset so playback continues without interruption.
  */
 @OptIn(UnstableApi::class)
 internal class ChunkedYoutubeDataSource(
     private val client: OkHttpClient,
     private val userAgent: String?,
     private val initialUseQueryRange: Boolean = false,
+    private val videoId: String? = null,
+    private val initialExpiresAtMs: Long = 0L,
+    private val streamRefresher: ((String) -> ResolvedExternalStream?)? = null,
 ) : DataSource {
     private val listeners = mutableListOf<TransferListener>()
     private var baseDataSpec: DataSpec? = null
@@ -359,6 +366,9 @@ internal class ChunkedYoutubeDataSource(
     private var requestedEndExclusive: Long = C.LENGTH_UNSET.toLong()
     private var lastResponseHeaders: Map<String, List<String>> = emptyMap()
     private var preferQueryRange: Boolean = initialUseQueryRange
+    private var activeUserAgent: String? = userAgent
+    private var activeExtraHeaders: Map<String, String> = emptyMap()
+    private var activeExpiresAtMs: Long = initialExpiresAtMs
     private var chunkRequestSeq: Int = 0
 
     override fun addTransferListener(transferListener: TransferListener) {
@@ -370,13 +380,25 @@ internal class ChunkedYoutubeDataSource(
     override fun open(dataSpec: DataSpec): Long {
         closeCurrentChunk()
         baseDataSpec = dataSpec
-        resolvedBaseUrl = stripRangeQueryParams(dataSpec.uri.toString())
+        val rawUrl = dataSpec.uri.toString()
+        resolvedBaseUrl = stripRangeQueryParams(rawUrl)
         activeUri = dataSpec.uri
         currentPos = dataSpec.position.coerceAtLeast(0L)
         preferQueryRange = initialUseQueryRange
+        activeUserAgent = userAgent
+        activeExtraHeaders = dataSpec.httpRequestHeaders.filterKeys { key ->
+            !key.equals("Range", ignoreCase = true) &&
+                !key.equals("User-Agent", ignoreCase = true) &&
+                !key.equals("Accept-Encoding", ignoreCase = true) &&
+                !key.equals(HEADER_USE_QUERY_RANGE, ignoreCase = true) &&
+                !key.equals(HEADER_VIDEO_ID, ignoreCase = true)
+        }
+        activeExpiresAtMs = initialExpiresAtMs.takeIf { it > 0L }
+            ?: extractExpireEpochMsFromUrl(rawUrl)
+            ?: 0L
         chunkRequestSeq = 0
         // Extract authoritative total byte length from YouTube's `clen=` query param when present
-        totalLength = extractClenFromUrl(dataSpec.uri.toString()) ?: C.LENGTH_UNSET.toLong()
+        totalLength = extractClenFromUrl(rawUrl) ?: C.LENGTH_UNSET.toLong()
         requestedEndExclusive = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
             currentPos + dataSpec.length
         } else {
@@ -393,6 +415,42 @@ internal class ChunkedYoutubeDataSource(
             totalLength != C.LENGTH_UNSET.toLong() -> (totalLength - currentPos).coerceAtLeast(0L)
             else -> C.LENGTH_UNSET.toLong()
         }
+    }
+
+    private fun refreshTokenAndRotateClient(reason: String): Boolean {
+        val vid = videoId?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+        val refresher = streamRefresher ?: return false
+        return runCatching {
+            val fresh = refresher(vid) ?: return false
+            if (fresh.isHls) {
+                MediaPlaybackBridge.latestHlsUserAgent = fresh.userAgent
+                throw HlsSwitchException(vid, fresh)
+            }
+            resolvedBaseUrl = stripRangeQueryParams(fresh.url)
+            activeUserAgent = fresh.userAgent.takeIf { it.isNotBlank() } ?: activeUserAgent
+            if (fresh.headers.isNotEmpty()) {
+                activeExtraHeaders = fresh.headers
+            }
+            preferQueryRange = fresh.useQueryRange
+            activeExpiresAtMs = fresh.expiresAtMs.takeIf { it > 0L }
+                ?: extractExpireEpochMsFromUrl(fresh.url)
+                ?: (System.currentTimeMillis() + TimeUnit.HOURS.toMillis(4))
+            chunkRequestSeq = 0
+            // Re-sync totalLength if the rotated client selected a slightly different representation
+            extractClenFromUrl(fresh.url)?.let { clen ->
+                if (totalLength == C.LENGTH_UNSET.toLong() || currentPos < clen) {
+                    totalLength = clen
+                }
+            }
+            AppLogger.info(
+                "Rotated Discover client mid-stream ($reason)",
+                "$vid -> ${fresh.sourceName} (${fresh.badgeLabel}) @ pos=${currentPos}B"
+            )
+            true
+        }.onFailure { err ->
+            if (err is HlsSwitchException) throw err
+            AppLogger.warning("Discover mid-stream client rotation failed ($vid)", err.message ?: err.javaClass.simpleName)
+        }.getOrDefault(false)
     }
 
     private fun executeChunkRequest(
@@ -419,17 +477,18 @@ internal class ChunkedYoutubeDataSource(
         }
 
         // Apply extra headers except internal/Range/User-Agent (single authoritative User-Agent below)
-        spec.httpRequestHeaders.forEach { (key, value) ->
+        activeExtraHeaders.forEach { (key, value) ->
             if (!key.equals("Range", ignoreCase = true) &&
                 !key.equals("User-Agent", ignoreCase = true) &&
                 !key.equals("Accept-Encoding", ignoreCase = true) &&
                 !key.equals(HEADER_USE_QUERY_RANGE, ignoreCase = true) &&
+                !key.equals(HEADER_VIDEO_ID, ignoreCase = true) &&
                 value.isNotBlank()
             ) {
                 reqBuilder.header(key, value)
             }
         }
-        val resolvedUa = userAgent?.takeIf { it.isNotBlank() }
+        val resolvedUa = activeUserAgent?.takeIf { it.isNotBlank() }
             ?: spec.httpRequestHeaders.entries
                 .firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }
                 ?.value
@@ -452,25 +511,35 @@ internal class ChunkedYoutubeDataSource(
     private fun openNextChunk(isInitialChunk: Boolean = false): Boolean {
         closeCurrentChunk()
         val spec = baseDataSpec ?: return false
-        val baseUrl = resolvedBaseUrl ?: stripRangeQueryParams(spec.uri.toString())
+
+        // Proactively refresh the stream token before expiry so long tracks or paused sessions never hit 403
+        val now = System.currentTimeMillis()
+        if (activeExpiresAtMs in 1L..(now + TOKEN_EXPIRY_SAFETY_WINDOW_MS)) {
+            refreshTokenAndRotateClient("token expiring")
+        }
+
+        var baseUrl = resolvedBaseUrl ?: stripRangeQueryParams(spec.uri.toString())
         if (totalLength != C.LENGTH_UNSET.toLong() && currentPos >= totalLength) return false
         if (requestedEndExclusive != C.LENGTH_UNSET.toLong() && currentPos >= requestedEndExclusive) return false
 
-        var chunkLen = CHUNK_SIZE_BYTES
-        if (totalLength != C.LENGTH_UNSET.toLong()) {
-            chunkLen = minOf(chunkLen, totalLength - currentPos)
+        fun computeRangeEnd(): Long {
+            var chunkLen = CHUNK_SIZE_BYTES
+            if (totalLength != C.LENGTH_UNSET.toLong()) {
+                chunkLen = minOf(chunkLen, totalLength - currentPos)
+            }
+            if (requestedEndExclusive != C.LENGTH_UNSET.toLong()) {
+                chunkLen = minOf(chunkLen, requestedEndExclusive - currentPos)
+            }
+            return if (chunkLen <= 0L) -1L else (currentPos + chunkLen - 1L)
         }
-        if (requestedEndExclusive != C.LENGTH_UNSET.toLong()) {
-            chunkLen = minOf(chunkLen, requestedEndExclusive - currentPos)
-        }
-        if (chunkLen <= 0L) return false
 
-        val rangeEnd = currentPos + chunkLen - 1L
+        var rangeEnd = computeRangeEnd()
+        if (rangeEnd < currentPos) return false
+
         var usedQueryMode = preferQueryRange
         var response = executeChunkRequest(spec, baseUrl, currentPos, rangeEnd, usedQueryMode)
 
-        // Automatic fallback between YouTube native `&range=` query mode and HTTP `Range:` header
-        // if googlevideo.com rejects one mode with HTTP 403 (common on ANDROID_VR / VPN edge nodes).
+        // Step 1: Automatic fallback between YouTube native `&range=` query mode and HTTP `Range:` header
         if (response.code == 403) {
             response.close()
             val alternateMode = !usedQueryMode
@@ -484,6 +553,35 @@ internal class ChunkedYoutubeDataSource(
                 )
             }
             response = retryResponse
+        }
+
+        // Step 2: If still 403 / 401 / 410, invalidate the current client/token and rotate through
+        // alternate InnerTube / NewPipe clients in place without failing ExoPlayer playback.
+        var rotationAttempt = 0
+        while ((response.code == 403 || response.code == 401 || response.code == 410) &&
+            rotationAttempt < MAX_CLIENT_ROTATIONS_PER_CHUNK
+        ) {
+            val failedCode = response.code
+            response.close()
+            rotationAttempt++
+            if (!refreshTokenAndRotateClient("HTTP $failedCode attempt #$rotationAttempt")) {
+                break
+            }
+            baseUrl = resolvedBaseUrl ?: baseUrl
+            rangeEnd = computeRangeEnd()
+            if (rangeEnd < currentPos) return false
+            usedQueryMode = preferQueryRange
+            response = executeChunkRequest(spec, baseUrl, currentPos, rangeEnd, usedQueryMode)
+            if (response.code == 403) {
+                response.close()
+                val alternateMode = !usedQueryMode
+                val altResponse = executeChunkRequest(spec, baseUrl, currentPos, rangeEnd, alternateMode)
+                if (altResponse.code in 200..299) {
+                    preferQueryRange = alternateMode
+                    usedQueryMode = alternateMode
+                }
+                response = altResponse
+            }
         }
 
         val code = response.code
@@ -503,7 +601,7 @@ internal class ChunkedYoutubeDataSource(
             val host = spec.uri.host.orEmpty()
             AppLogger.warning(
                 "Chunked Discover HTTP $code",
-                "host=$host mode=${if (usedQueryMode) "query" else "header"} pos=$currentPos-$rangeEnd contentType=${response.header("Content-Type").orEmpty()}"
+                "host=$host mode=${if (usedQueryMode) "query" else "header"} pos=$currentPos-$rangeEnd rotations=$rotationAttempt contentType=${response.header("Content-Type").orEmpty()}"
             )
             response.close()
             throw HttpDataSource.InvalidResponseCodeException(
@@ -537,10 +635,11 @@ internal class ChunkedYoutubeDataSource(
         val contentRange = response.header("Content-Range")
         val parsedTotal = parseContentRangeTotal(contentRange)
         val contentLength = body.contentLength()
+        val expectedChunkLen = (rangeEnd - currentPos + 1L).coerceAtLeast(1L)
         when {
             parsedTotal != null && parsedTotal > 0L -> totalLength = parsedTotal
             !usedQueryMode && code == 200 && contentLength > 0L -> totalLength = currentPos + contentLength
-            contentLength in 0L until chunkLen -> totalLength = currentPos + contentLength
+            contentLength in 0L until expectedChunkLen -> totalLength = currentPos + contentLength
         }
         return true
     }
@@ -552,6 +651,10 @@ internal class ChunkedYoutubeDataSource(
             val read = try {
                 stream.read(buffer, offset, length)
             } catch (io: IOException) {
+                // If an active chunk socket drops mid-read, try rotating/re-opening at currentPos once
+                if (refreshTokenAndRotateClient("mid-chunk IO reset") && openNextChunk(isInitialChunk = false)) {
+                    continue
+                }
                 val spec = baseDataSpec
                 if (spec != null) {
                     throw HttpDataSource.HttpDataSourceException.createForIOException(
@@ -611,9 +714,13 @@ internal class ChunkedYoutubeDataSource(
 
     companion object {
         private const val CHUNK_SIZE_BYTES = 512L * 1024L // 512 KB bounded chunks
+        private const val MAX_CLIENT_ROTATIONS_PER_CHUNK = 2
+        private const val TOKEN_EXPIRY_SAFETY_WINDOW_MS = 90_000L
         internal const val HEADER_USE_QUERY_RANGE = "X-PocketLink-Use-Query-Range"
+        internal const val HEADER_VIDEO_ID = "X-PocketLink-Video-Id"
         private val RANGE_PARAM_REGEX = Regex("([?&])(?:range|rn|rbuf)=[^&]*", RegexOption.IGNORE_CASE)
         private val CLEN_PARAM_REGEX = Regex("[?&]clen=(\\d+)", RegexOption.IGNORE_CASE)
+        private val EXPIRE_PARAM_REGEX = Regex("[?&]expire=(\\d+)", RegexOption.IGNORE_CASE)
 
         internal fun parseContentRangeTotal(header: String?): Long? {
             if (header.isNullOrBlank()) return null
@@ -624,6 +731,18 @@ internal class ChunkedYoutubeDataSource(
 
         internal fun extractClenFromUrl(url: String): Long? =
             CLEN_PARAM_REGEX.find(url)?.groupValues?.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0L }
+
+        internal fun extractExpireEpochMsFromUrl(url: String): Long? =
+            EXPIRE_PARAM_REGEX.find(url)?.groupValues?.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0L }?.times(1_000L)
+
+        internal fun isStreamTokenExpiringSoon(
+            url: String,
+            nowMs: Long = System.currentTimeMillis(),
+            safetyWindowMs: Long = TOKEN_EXPIRY_SAFETY_WINDOW_MS,
+        ): Boolean {
+            val expireMs = extractExpireEpochMsFromUrl(url) ?: return false
+            return expireMs <= nowMs + safetyWindowMs
+        }
 
         internal fun stripRangeQueryParams(url: String): String {
             val qIdx = url.indexOf('?')
@@ -682,11 +801,17 @@ private class RoutingHttpDataSource(
             .firstOrNull { it.key.equals(ChunkedYoutubeDataSource.HEADER_USE_QUERY_RANGE, ignoreCase = true) }
             ?.value
             .equals("true", ignoreCase = true)
+        val videoIdHint = dataSpec.httpRequestHeaders.entries
+            .firstOrNull { it.key.equals(ChunkedYoutubeDataSource.HEADER_VIDEO_ID, ignoreCase = true) }
+            ?.value
+            ?.takeIf { it.isNotBlank() }
         val (created, effectiveSpec) = if (isGoogleVideo) {
             val chunked = ChunkedYoutubeDataSource(
                 client = client,
                 userAgent = customUa,
                 initialUseQueryRange = useQueryRangeHint,
+                videoId = videoIdHint,
+                streamRefresher = { vid -> MediaPlaybackBridge.refreshStreamForChunkedDataSource(vid) },
             ).apply {
                 listeners.forEach { addTransferListener(it) }
             }
@@ -695,7 +820,8 @@ private class RoutingHttpDataSource(
             val factory = OkHttpDataSource.Factory(client)
             val filteredHeaders = dataSpec.httpRequestHeaders.filterKeys {
                 !it.equals("User-Agent", ignoreCase = true) &&
-                    !it.equals(ChunkedYoutubeDataSource.HEADER_USE_QUERY_RANGE, ignoreCase = true)
+                    !it.equals(ChunkedYoutubeDataSource.HEADER_USE_QUERY_RANGE, ignoreCase = true) &&
+                    !it.equals(ChunkedYoutubeDataSource.HEADER_VIDEO_ID, ignoreCase = true)
             }
             val cleanedSpec = if (!customUa.isNullOrBlank()) {
                 factory.setUserAgent(customUa)
@@ -772,6 +898,18 @@ internal object MediaPlaybackBridge {
         }
     }
 
+    /**
+     * Marks the active client for [videoId] as failed/expired, resolves a fresh stream
+     * from the next client in the waterfall, and updates the UI badge/source metadata.
+     */
+    internal fun refreshStreamForChunkedDataSource(videoId: String): ResolvedExternalStream? {
+        onYtStreamError?.invoke(videoId)
+        val resolver = ytStreamResolver ?: return null
+        val resolved = resolver(videoId)
+        onResolvedStreamMeta?.invoke(videoId, resolved.badgeLabel, resolved.sourceName)
+        return resolved
+    }
+
     internal fun extractVideoIdFromBridgeUri(uri: Uri): String {
         val fromQuery = uri.getQueryParameter("v")?.trim()
         if (!fromQuery.isNullOrEmpty()) return fromQuery
@@ -809,6 +947,7 @@ internal object MediaPlaybackBridge {
                 if (resolved.useQueryRange) {
                     mergedHeaders[ChunkedYoutubeDataSource.HEADER_USE_QUERY_RANGE] = "true"
                 }
+                mergedHeaders[ChunkedYoutubeDataSource.HEADER_VIDEO_ID] = videoId
                 resolved.headers.forEach { (k, v) -> mergedHeaders[k] = v }
                 dataSpec.buildUpon()
                     .setUri(Uri.parse(resolved.url))

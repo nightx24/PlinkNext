@@ -43,11 +43,17 @@ enum class CloudflareTunnelMode(
     val shortLabel: String,
     val summary: String,
 ) {
+    AUTO_EDGE(
+        id = "auto_edge",
+        label = "Instant Auto Tunnel",
+        shortLabel = "Auto (1-Click)",
+        summary = "Zero manual entry — automatically generates device tunnel credentials, registers an encrypted Cloudflare HTTPS session, and links to local port 8000 in one tap.",
+    ),
     EDGE_BRIDGE(
         id = "edge_bridge",
-        label = "Built-in Edge Tunnel",
-        shortLabel = "Edge Tunnel",
-        summary = "Pure-Kotlin WSS reverse tunnel via your free Cloudflare Worker — runs natively inside PocketLink with no external binary.",
+        label = "Custom Worker Edge",
+        shortLabel = "Edge Worker",
+        summary = "Pure-Kotlin WSS reverse tunnel via your custom Cloudflare Worker — runs natively inside PocketLink with no external binary.",
     ),
     ZERO_TRUST(
         id = "zero_trust",
@@ -59,7 +65,7 @@ enum class CloudflareTunnelMode(
 
     companion object {
         fun fromId(raw: String?): CloudflareTunnelMode =
-            entries.firstOrNull { it.id.equals(raw?.trim(), ignoreCase = true) } ?: EDGE_BRIDGE
+            entries.firstOrNull { it.id.equals(raw?.trim(), ignoreCase = true) } ?: AUTO_EDGE
     }
 }
 
@@ -84,7 +90,9 @@ data class CloudflareTokenInfo(
 
 data class CloudflareTunnelConfig(
     val provider: TunnelProviderId = TunnelProviderId.CLOUDFLARE,
-    val mode: CloudflareTunnelMode = CloudflareTunnelMode.EDGE_BRIDGE,
+    val mode: CloudflareTunnelMode = CloudflareTunnelMode.AUTO_EDGE,
+    val autoPublicUrl: String = "",
+    val autoSubdomain: String = "",
     val workerPublicUrl: String = "",
     val zeroTrustPublicUrl: String = "",
     val hasWorkerSecret: Boolean = false,
@@ -94,16 +102,18 @@ data class CloudflareTunnelConfig(
 ) {
     val activePublicUrl: String
         get() = when (mode) {
-            CloudflareTunnelMode.EDGE_BRIDGE -> workerPublicUrl
-            CloudflareTunnelMode.ZERO_TRUST -> zeroTrustPublicUrl
+            CloudflareTunnelMode.AUTO_EDGE -> autoPublicUrl.ifBlank { workerPublicUrl.ifBlank { zeroTrustPublicUrl } }
+            CloudflareTunnelMode.EDGE_BRIDGE -> workerPublicUrl.ifBlank { autoPublicUrl }
+            CloudflareTunnelMode.ZERO_TRUST -> zeroTrustPublicUrl.ifBlank { autoPublicUrl }
         }
 
     val isReadyToStart: Boolean
         get() = when (mode) {
+            CloudflareTunnelMode.AUTO_EDGE -> true
             CloudflareTunnelMode.EDGE_BRIDGE ->
-                workerPublicUrl.isNotBlank() && hasWorkerSecret
+                (workerPublicUrl.isNotBlank() && hasWorkerSecret) || autoPublicUrl.isNotBlank()
             CloudflareTunnelMode.ZERO_TRUST ->
-                zeroTrustPublicUrl.isNotBlank()
+                zeroTrustPublicUrl.isNotBlank() || autoPublicUrl.isNotBlank()
         }
 }
 
@@ -226,16 +236,18 @@ data class ParsedConnectLink(
     val username: String? = null,
     val serverName: String? = null,
     val isHttps: Boolean = false,
+    val password: String? = null,
 )
 
 /**
- * Builds a shareable one-tap PocketLink connect link (`pocketlink://connect?url=...&user=...&name=...`)
- * so clients can paste it directly into the Connection screen without typing host/port manually.
+ * Builds a shareable one-tap PocketLink connect link (`pocketlink://connect?url=...&user=...&name=...&pwd=...`)
+ * so clients can paste it directly into the Connection screen and connect in 1 tap without typing host/port/password manually.
  */
 fun buildPocketLinkConnectUri(
     publicUrl: String,
     username: String = "admin",
     serverName: String = "",
+    password: String = "",
 ): String {
     val cleanUrl = publicUrl.trim().trimEnd('/')
     val encodedUrl = java.net.URLEncoder.encode(cleanUrl, "UTF-8")
@@ -243,12 +255,15 @@ fun buildPocketLinkConnectUri(
     val nameParam = serverName.trim().takeIf { it.isNotBlank() }?.let {
         "&name=${java.net.URLEncoder.encode(it, "UTF-8")}"
     }.orEmpty()
-    return "pocketlink://connect?url=$encodedUrl&user=$encodedUser$nameParam"
+    val pwdParam = password.takeIf { it.isNotEmpty() }?.let {
+        "&pwd=${java.net.URLEncoder.encode(it, "UTF-8")}"
+    }.orEmpty()
+    return "pocketlink://connect?url=$encodedUrl&user=$encodedUser$nameParam$pwdParam"
 }
 
 /**
  * Smart parser for clipboard/pasted server addresses:
- * - `pocketlink://connect?url=https%3A%2F%2F...&user=admin&name=Home`
+ * - `pocketlink://connect?url=https%3A%2F%2F...&user=admin&name=Home&pwd=...`
  * - `https://my-host.workers.dev` or bare `my-host.workers.dev` / `abc.trycloudflare.com`
  * - `http://100.68.88.73:8000` or bare `100.68.88.73:8000` / `100.68.88.73`
  */
@@ -276,6 +291,7 @@ fun parsePocketLinkConnectInput(raw: String): ParsedConnectLink? {
         return parsed.copy(
             username = params["user"]?.trim()?.takeIf { it.isNotBlank() } ?: parsed.username,
             serverName = params["name"]?.trim()?.takeIf { it.isNotBlank() } ?: parsed.serverName,
+            password = params["pwd"]?.takeIf { it.isNotEmpty() } ?: parsed.password,
         )
     }
 

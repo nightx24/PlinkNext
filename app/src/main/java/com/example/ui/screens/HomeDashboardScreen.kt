@@ -255,8 +255,11 @@ fun HomeDashboardScreen(
     )
 
     Scaffold(
+        containerColor = Color.Transparent,
         topBar = {
-            TopAppBar(
+            com.example.ui.components.PocketLinkTopBar(
+                title = "PocketLink",
+                subtitle = "Your private space",
                 navigationIcon = {
                     IconButton(
                         onClick = onOpenDrawer,
@@ -265,60 +268,44 @@ fun HomeDashboardScreen(
                         Icon(Icons.Rounded.Menu, contentDescription = "Open storage menu")
                     }
                 },
-                    title = {
-                        Column {
-                            Text(
-                                text = "PocketLink",
-                                style = MaterialTheme.typography.titleLarge,
-                                fontWeight = FontWeight.Black,
-                                letterSpacing = (-0.5).sp,
-                            )
-                            Text(
-                                text = "Your private space",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    },
-                    actions = {
-                        LiquidGlassPill(
-                            useLiquidGlass = settings.useLiquidGlass,
-                            shape = RoundedCornerShape(14.dp),
-                        ) {
-                            IconButton(
-                                onClick = onOpenTransfers,
-                                modifier = Modifier.size(40.dp).testTag("dashboard_transfers_btn"),
-                            ) {
-                                Icon(
-                                    Icons.Rounded.SwapHoriz,
-                                    contentDescription = "Transfers",
-                                    tint = MaterialTheme.colorScheme.onSurface,
-                                    modifier = Modifier.size(20.dp),
-                                )
-                            }
-                        }
-                        Spacer(Modifier.width(4.dp))
+                actions = {
+                    LiquidGlassPill(
+                        useLiquidGlass = settings.useLiquidGlass,
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
                         IconButton(
-                            onClick = { if (!refreshing) scope.launch { loadAll() } },
-                            modifier = Modifier.testTag("dashboard_refresh_btn"),
+                            onClick = onOpenTransfers,
+                            modifier = Modifier.size(40.dp).testTag("dashboard_transfers_btn"),
                         ) {
                             Icon(
-                                Icons.Rounded.Refresh,
-                                contentDescription = "Refresh dashboard",
-                                modifier = if (refreshing) Modifier.rotate(spinAngle) else Modifier,
+                                Icons.Rounded.SwapHoriz,
+                                contentDescription = "Transfers",
+                                tint = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.size(20.dp),
                             )
                         }
-                        IconButton(
-                            onClick = onOpenSettings,
-                            modifier = Modifier.testTag("dashboard_settings_btn"),
-                        ) {
-                            Icon(Icons.Rounded.Settings, contentDescription = "Settings")
-                        }
-                    },
-                    colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
-                )
-            }
-        ) { innerPadding ->
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    IconButton(
+                        onClick = { if (!refreshing) scope.launch { loadAll() } },
+                        modifier = Modifier.testTag("dashboard_refresh_btn"),
+                    ) {
+                        Icon(
+                            Icons.Rounded.Refresh,
+                            contentDescription = "Refresh dashboard",
+                            modifier = if (refreshing) Modifier.rotate(spinAngle) else Modifier,
+                        )
+                    }
+                    IconButton(
+                        onClick = onOpenSettings,
+                        modifier = Modifier.testTag("dashboard_settings_btn"),
+                    ) {
+                        Icon(Icons.Rounded.Settings, contentDescription = "Settings")
+                    }
+                },
+            )
+        }
+    ) { innerPadding ->
             LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()

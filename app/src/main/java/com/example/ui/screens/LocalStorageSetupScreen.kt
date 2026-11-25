@@ -99,6 +99,7 @@ fun LocalStorageSetupScreen(
     hostStatus: LocalHostStatus,
     onBack: () -> Unit,
     onConnectLocal: (() -> Unit)? = null,
+    onConnectCloudflare: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -253,6 +254,7 @@ fun LocalStorageSetupScreen(
                         tunnelStatus = tunnelStatus,
                         tunnelConfig = tunnelConfig,
                         hostRunning = hostStatus.running,
+                        onConnectCloudflare = onConnectCloudflare,
                         onMessage = { msg -> scope.launch { snackbarHostState.showSnackbar(msg) } },
                     )
                 }

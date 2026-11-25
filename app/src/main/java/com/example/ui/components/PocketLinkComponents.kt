@@ -162,54 +162,89 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
+val LocalHeaderBlurEnabled = compositionLocalOf { true }
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PocketLinkTopBar(
     title: String,
     subtitle: String? = null,
     onBack: (() -> Unit)? = null,
+    navigationIcon: (@Composable () -> Unit)? = null,
     actions: @Composable () -> Unit = {},
 ) {
-    TopAppBar(
-        title = {
-            Column {
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.ExtraBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                if (!subtitle.isNullOrBlank()) {
+    val headerBlurEnabled = LocalHeaderBlurEnabled.current
+    val isDark = LocalPocketLinkDarkTheme.current
+    val baseBg = MaterialTheme.colorScheme.background
+    val tintTop = baseBg.copy(alpha = if (headerBlurEnabled) (if (isDark) 0.56f else 0.72f) else 0.0f)
+    val tintBottom = baseBg.copy(alpha = if (headerBlurEnabled) (if (isDark) 0.34f else 0.48f) else 0.0f)
+    val hairlineColor = if (headerBlurEnabled) {
+        if (isDark) Color.White.copy(alpha = 0.09f) else Color.Black.copy(alpha = 0.07f)
+    } else {
+        Color.Transparent
+    }
+
+    Box(modifier = Modifier.fillMaxWidth()) {
+        // Header-only backdrop blur layer (toggled independently in Appearance Settings)
+        if (headerBlurEnabled) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .liquidBackdropBlur(20.dp)
+                    .background(Brush.verticalGradient(listOf(tintTop, tintBottom)))
+                    .drawBehind {
+                        drawLine(
+                            color = hairlineColor,
+                            start = Offset(0f, size.height - 1f),
+                            end = Offset(size.width, size.height - 1f),
+                            strokeWidth = 1.dp.toPx(),
+                        )
+                    },
+            )
+        }
+        TopAppBar(
+            title = {
+                Column {
                     Text(
-                        text = subtitle,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        text = title,
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.ExtraBold,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+                    if (!subtitle.isNullOrBlank()) {
+                        Text(
+                            text = subtitle,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
-            }
-        },
-        navigationIcon = {
-            if (onBack != null) {
-                IconButton(
-                    onClick = onBack,
-                    modifier = Modifier.testTag("top_bar_back"),
-                ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
-                        contentDescription = "Back",
-                    )
+            },
+            navigationIcon = {
+                if (navigationIcon != null) {
+                    navigationIcon()
+                } else if (onBack != null) {
+                    IconButton(
+                        onClick = onBack,
+                        modifier = Modifier.testTag("top_bar_back"),
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                            contentDescription = "Back",
+                        )
+                    }
                 }
-            }
-        },
-        actions = { actions() },
-        colors = TopAppBarDefaults.topAppBarColors(
-            containerColor = MaterialTheme.colorScheme.background,
-            scrolledContainerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-        ),
-    )
+            },
+            actions = { actions() },
+            colors = TopAppBarDefaults.topAppBarColors(
+                containerColor = Color.Transparent,
+                scrolledContainerColor = Color.Transparent,
+            ),
+        )
+    }
 }
 
 @Composable

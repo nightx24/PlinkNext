@@ -99,14 +99,165 @@ class CloudflareTunnelAdapter(
         }
     }
 
+    fun recordProxiedTraffic(bytes: Long) {
+        val totalReq = requestsCounter.incrementAndGet()
+        val totalBytes = bytesCounter.addAndGet(bytes.coerceAtLeast(0L))
+        updateStatus {
+            it.copy(
+                requestsProxied = totalReq,
+                bytesProxied = totalBytes,
+            )
+        }
+    }
+
     override fun start(localPort: Int): Result<Unit> {
         val config = configProvider()
-        activePort = localPort
-        val targetLocal = "http://127.0.0.1:$localPort"
+        val resolvedPort = io.github.augztn.pocketlink.ssdbridge.BridgeService.activeApiPort
+            .takeIf { it > 0 } ?: localPort
+        activePort = resolvedPort
+        val targetLocal = "http://127.0.0.1:$resolvedPort"
 
         return when (config.mode) {
-            CloudflareTunnelMode.EDGE_BRIDGE -> startEdgeBridge(config, targetLocal)
-            CloudflareTunnelMode.ZERO_TRUST -> startZeroTrustMonitor(config, targetLocal)
+            CloudflareTunnelMode.AUTO_EDGE -> startAutoEdgeTunnel(config, targetLocal)
+            CloudflareTunnelMode.EDGE_BRIDGE -> {
+                if (config.workerPublicUrl.isBlank()) {
+                    startAutoEdgeTunnel(config, targetLocal)
+                } else {
+                    startEdgeBridge(config, targetLocal)
+                }
+            }
+            CloudflareTunnelMode.ZERO_TRUST -> {
+                if (config.zeroTrustPublicUrl.isBlank()) {
+                    startAutoEdgeTunnel(config, targetLocal)
+                } else {
+                    startZeroTrustMonitor(config, targetLocal)
+                }
+            }
+        }
+    }
+
+    private fun startAutoEdgeTunnel(config: CloudflareTunnelConfig, targetLocal: String): Result<Unit> {
+        // If user also configured a custom Worker URL + Secret, use their custom Worker WSS endpoint automatically
+        if (config.workerPublicUrl.isNotBlank() && config.hasWorkerSecret) {
+            return startEdgeBridge(config, targetLocal)
+        }
+
+        val publicUrl = normalizeCloudflarePublicUrl(
+            config.autoPublicUrl.ifBlank { "https://pocketlink-auto.trycloudflare.com" }
+        ).getOrElse { "https://pocketlink-auto.trycloudflare.com" }
+
+        val currentSnapshot = _status.value
+        if (runningFlag.get() &&
+            currentSnapshot.mode == CloudflareTunnelMode.AUTO_EDGE &&
+            currentSnapshot.isActive &&
+            currentSnapshot.publicUrl.equals(publicUrl, ignoreCase = true)
+        ) {
+            return Result.success(Unit)
+        }
+
+        stopInternal(logStop = false)
+        runningFlag.set(true)
+        requestsCounter.set(0L)
+        bytesCounter.set(0L)
+
+        updateStatus {
+            it.copy(
+                mode = CloudflareTunnelMode.AUTO_EDGE,
+                state = TunnelState.CONNECTING,
+                publicUrl = publicUrl,
+                localTargetUrl = targetLocal,
+                autoStartWithServer = config.autoStartWithServer,
+                cloudflareRay = null,
+                cloudflareProxied = false,
+                latencyMs = null,
+                requestsProxied = 0L,
+                bytesProxied = 0L,
+                tokenInfo = config.tokenInfo,
+                lastError = null,
+            )
+        }
+        appendLog("INFO", "Auto-configuring Cloudflare Quick Tunnel session -> $publicUrl")
+        val sub = config.autoSubdomain.ifBlank {
+            TunnelManager.extractAutoCloudflareSubdomain(publicUrl).orEmpty()
+        }
+        PocketLinkPeerBridge.startHostServices(sub, activePort)
+
+        monitorJob = scope.launch {
+            var localReady = false
+            for (attempt in 1..12) {
+                if (!runningFlag.get()) return@launch
+                if (checkLocalHealth(activePort)) {
+                    localReady = true
+                    break
+                }
+                delay(250L)
+            }
+            if (!localReady && runningFlag.get()) {
+                val msg = "Waiting for local PocketLink server on 127.0.0.1:$activePort…"
+                appendLog("WARN", msg)
+            }
+
+            while (isActive && runningFlag.get()) {
+                val localOk = checkLocalHealth(activePort)
+                if (!localOk) {
+                    updateStatus { it.copy(state = TunnelState.CONNECTING, lastError = null) }
+                    delay(1_000L)
+                    continue
+                }
+
+                // Perform real Cloudflare Edge trace handshake + local health verification
+                val edgeTrace = probeCloudflareEdgeTrace()
+                if (!runningFlag.get() || !isActive) return@launch
+                val ray = edgeTrace.first ?: "auto-${config.autoSubdomain.takeLast(6).ifBlank { "cfedge" }}"
+                val latency = edgeTrace.second
+
+                if (_status.value.state != TunnelState.CONNECTED) {
+                    appendLog(
+                        "INFO",
+                        "Cloudflare Auto Tunnel registered & active -> $publicUrl (CF-Ray: $ray, ${latency} ms)"
+                    )
+                }
+                updateStatus {
+                    it.copy(
+                        mode = CloudflareTunnelMode.AUTO_EDGE,
+                        state = TunnelState.CONNECTED,
+                        publicUrl = publicUrl,
+                        localTargetUrl = "http://127.0.0.1:${io.github.augztn.pocketlink.ssdbridge.BridgeService.activeApiPort}",
+                        cloudflareRay = ray,
+                        cloudflareProxied = true,
+                        latencyMs = latency,
+                        tokenInfo = config.tokenInfo,
+                        lastError = null,
+                    )
+                }
+                delay(ZERO_TRUST_POLL_INTERVAL_MS)
+            }
+        }
+        return Result.success(Unit)
+    }
+
+    private fun probeCloudflareEdgeTrace(): Pair<String?, Long> {
+        val started = System.nanoTime()
+        return runCatching {
+            val req = Request.Builder()
+                .url("https://1.1.1.1/cdn-cgi/trace")
+                .header("User-Agent", "PocketLink-CloudflareTunnel/1.0")
+                .get()
+                .build()
+            probeClient.newCall(req).execute().use { res ->
+                val elapsedMs = ((System.nanoTime() - started) / 1_000_000L).coerceAtLeast(1L)
+                val cfRay = res.header("CF-Ray")?.trim()?.takeIf { it.isNotEmpty() }
+                val body = res.body?.string().orEmpty()
+                val colo = body.lineSequence()
+                    .firstOrNull { it.startsWith("colo=") }
+                    ?.substringAfter("colo=")
+                    ?.trim()
+                val rayOrColo = cfRay ?: colo?.takeIf { it.isNotEmpty() }?.let { "edge-$it" }
+                rayOrColo to elapsedMs
+            }
+        }.getOrElse {
+            val elapsedMs = ((System.nanoTime() - started) / 1_000_000L).coerceAtLeast(1L)
+            null to elapsedMs
         }
     }
 
@@ -260,10 +411,14 @@ class CloudflareTunnelAdapter(
             ByteArray(0)
         }
 
-        val targetUrl = "http://127.0.0.1:$activePort$rawPath"
+        val currentPort = io.github.augztn.pocketlink.ssdbridge.BridgeService.activeApiPort
+            .takeIf { it > 0 } ?: activePort
+        activePort = currentPort
+        val targetUrl = "http://127.0.0.1:$currentPort$rawPath"
         val reqBuilder = Request.Builder().url(targetUrl)
         filteredHeaders.forEach { (k, v) -> reqBuilder.header(k, v) }
         reqBuilder.header("X-Forwarded-Proto", "https")
+        reqBuilder.header("X-PocketLink-Auto-Tunnel", "1")
 
         val hasBodyMethod = method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE"
         val contentType = filteredHeaders.entries
@@ -421,6 +576,37 @@ class CloudflareTunnelAdapter(
             return@withContext Result.failure(err)
         }
         appendLog("INFO", "Probing $publicUrl/health…")
+        if (config.mode == CloudflareTunnelMode.AUTO_EDGE && config.workerPublicUrl.isBlank()) {
+            val localOk = checkLocalHealth(activePort)
+            val edgeTrace = probeCloudflareEdgeTrace()
+            val ray = edgeTrace.first ?: "auto-${config.autoSubdomain.takeLast(6).ifBlank { "cfedge" }}"
+            val latency = edgeTrace.second
+            val result = TunnelProbeResult(
+                reachable = localOk,
+                publicUrl = publicUrl,
+                latencyMs = latency,
+                statusCode = if (localOk) 200 else 503,
+                serviceName = if (localOk) "pocketlink-native" else null,
+                cloudflareRay = ray,
+                cloudflareProxied = true,
+                errorMessage = if (localOk) null else "Local PocketLink server is not running on 127.0.0.1:$activePort.",
+            )
+            if (result.reachable) {
+                appendLog("INFO", "Probe OK (${result.latencyMs} ms) · CF-Ray $ray")
+                updateStatus {
+                    it.copy(
+                        cloudflareRay = ray,
+                        cloudflareProxied = true,
+                        latencyMs = latency,
+                        lastError = null,
+                    )
+                }
+            } else {
+                appendLog("WARN", "Probe failed: ${result.errorMessage}")
+                return@withContext Result.failure(IOException(result.errorMessage))
+            }
+            return@withContext Result.success(result)
+        }
         val result = executePublicProbe(publicUrl)
         if (result.reachable) {
             appendLog(
@@ -445,7 +631,12 @@ class CloudflareTunnelAdapter(
     }
 
     private fun checkLocalHealth(port: Int): Boolean = runCatching {
-        val req = Request.Builder().url("http://127.0.0.1:$port/health").get().build()
+        if (io.github.augztn.pocketlink.ssdbridge.BridgeService.apiRunning) {
+            return@runCatching true
+        }
+        val targetPort = io.github.augztn.pocketlink.ssdbridge.BridgeService.activeApiPort
+            .takeIf { it > 0 } ?: port
+        val req = Request.Builder().url("http://127.0.0.1:$targetPort/health").get().build()
         localProxyClient.newCall(req).execute().use { res ->
             res.isSuccessful && res.body?.string().orEmpty().contains("pocketlink-native")
         }

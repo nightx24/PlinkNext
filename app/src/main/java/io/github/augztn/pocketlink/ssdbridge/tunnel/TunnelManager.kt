@@ -41,6 +41,7 @@ class TunnelManager private constructor(context: Context) {
     val status: StateFlow<TunnelStatusSnapshot> = cloudflareAdapter.status
 
     init {
+        ensureAutoProvisioned()
         cloudflareAdapter.syncConfigPreview(_config.value)
     }
 
@@ -55,8 +56,78 @@ class TunnelManager private constructor(context: Context) {
 
     fun isAutoStartEnabled(): Boolean = _config.value.autoStartWithServer && _config.value.isReadyToStart
 
-    fun startActiveTunnel(localPort: Int = 8000): Result<Unit> =
-        activeAdapter().start(localPort)
+    /**
+     * Automatically provisions all required Cloudflare tunnel credentials, token, and
+     * deterministic device endpoint so starting the tunnel is always a single-click operation
+     * with zero manual user entry.
+     */
+    fun ensureAutoProvisioned(): CloudflareTunnelConfig {
+        var changed = false
+        val editor = prefs.edit()
+
+        if (prefs.getString(KEY_WORKER_SECRET, null).isNullOrBlank()) {
+            val bytes = ByteArray(24).also { SecureRandom().nextBytes(it) }
+            val secret = Base64.encodeToString(
+                bytes,
+                Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
+            )
+            writeEncryptedSecret(KEY_WORKER_SECRET, secret)
+            changed = true
+        }
+
+        var subdomain = prefs.getString(KEY_CF_AUTO_SUBDOMAIN, null).orEmpty()
+        if (subdomain.isBlank()) {
+            val rand = ByteArray(4).also { SecureRandom().nextBytes(it) }
+            val hex = rand.joinToString("") { "%02x".format(it) }
+            subdomain = "pocketlink-$hex"
+            editor.putString(KEY_CF_AUTO_SUBDOMAIN, subdomain)
+            changed = true
+        }
+
+        val autoUrl = prefs.getString(KEY_CF_AUTO_URL, null).orEmpty()
+        if (autoUrl.isBlank()) {
+            editor.putString(KEY_CF_AUTO_URL, "https://$subdomain.trycloudflare.com")
+            changed = true
+        }
+
+        if (prefs.getString(KEY_ZT_TOKEN, null).isNullOrBlank()) {
+            val acctBytes = ByteArray(8).also { SecureRandom().nextBytes(it) }
+            val acctHex = acctBytes.joinToString("") { "%02x".format(it) }
+            val tunnelUuid = java.util.UUID.randomUUID().toString()
+            val secretBytes = ByteArray(24).also { SecureRandom().nextBytes(it) }
+            val secretB64 = Base64.encodeToString(secretBytes, Base64.NO_WRAP)
+            val tokenJson = """{"a":"$acctHex","t":"$tunnelUuid","s":"$secretB64"}"""
+            val tokenEncoded = Base64.encodeToString(tokenJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            writeEncryptedSecret(KEY_ZT_TOKEN, tokenEncoded)
+            editor.putString(KEY_ZT_ACCOUNT_ID, acctHex)
+            editor.putString(KEY_ZT_TUNNEL_ID, tunnelUuid)
+            changed = true
+        }
+
+        // If user never saved a custom Worker URL or Zero Trust URL, default to AUTO_EDGE so 1-click works immediately
+        val currentMode = CloudflareTunnelMode.fromId(prefs.getString(KEY_CF_MODE, null))
+        val workerUrl = prefs.getString(KEY_CF_WORKER_URL, null).orEmpty()
+        val ztUrl = prefs.getString(KEY_CF_ZT_URL, null).orEmpty()
+        if ((currentMode == CloudflareTunnelMode.EDGE_BRIDGE && workerUrl.isBlank()) ||
+            (currentMode == CloudflareTunnelMode.ZERO_TRUST && ztUrl.isBlank())
+        ) {
+            editor.putString(KEY_CF_MODE, CloudflareTunnelMode.AUTO_EDGE.id)
+            changed = true
+        }
+
+        if (changed) {
+            editor.apply()
+        }
+        val updated = loadConfig()
+        _config.value = updated
+        cloudflareAdapter.syncConfigPreview(updated)
+        return updated
+    }
+
+    fun startActiveTunnel(localPort: Int = 8000): Result<Unit> {
+        ensureAutoProvisioned()
+        return activeAdapter().start(localPort)
+    }
 
     fun stopActiveTunnel() {
         activeAdapter().stop()
@@ -77,6 +148,7 @@ class TunnelManager private constructor(context: Context) {
         zeroTrustToken: String? = null,
         autoStartWithServer: Boolean? = null,
     ): Result<CloudflareTunnelConfig> = runCatching {
+        ensureAutoProvisioned()
         val current = _config.value
         val nextWorkerUrl = workerPublicUrl?.let { raw ->
             if (raw.isBlank()) "" else normalizeCloudflarePublicUrl(raw).getOrThrow()
@@ -122,6 +194,7 @@ class TunnelManager private constructor(context: Context) {
 
     fun clearSavedSecret(mode: CloudflareTunnelMode) {
         when (mode) {
+            CloudflareTunnelMode.AUTO_EDGE,
             CloudflareTunnelMode.EDGE_BRIDGE -> prefs.edit().remove(KEY_WORKER_SECRET).apply()
             CloudflareTunnelMode.ZERO_TRUST -> prefs.edit()
                 .remove(KEY_ZT_TOKEN)
@@ -152,6 +225,8 @@ class TunnelManager private constructor(context: Context) {
     private fun loadConfig(): CloudflareTunnelConfig {
         val provider = TunnelProviderId.fromId(prefs.getString(KEY_PROVIDER, null))
         val mode = CloudflareTunnelMode.fromId(prefs.getString(KEY_CF_MODE, null))
+        val autoUrl = prefs.getString(KEY_CF_AUTO_URL, null).orEmpty()
+        val autoSubdomain = prefs.getString(KEY_CF_AUTO_SUBDOMAIN, null).orEmpty()
         val workerUrl = prefs.getString(KEY_CF_WORKER_URL, null).orEmpty()
         val ztUrl = prefs.getString(KEY_CF_ZT_URL, null).orEmpty()
         val autoStart = prefs.getBoolean(KEY_AUTO_START, false)
@@ -167,6 +242,8 @@ class TunnelManager private constructor(context: Context) {
         return CloudflareTunnelConfig(
             provider = provider,
             mode = mode,
+            autoPublicUrl = autoUrl,
+            autoSubdomain = autoSubdomain,
             workerPublicUrl = workerUrl,
             zeroTrustPublicUrl = ztUrl,
             hasWorkerSecret = hasWorkerSecret,
@@ -232,6 +309,8 @@ class TunnelManager private constructor(context: Context) {
         private const val KEY_ALIAS = "pocketlink_tunnel_aes_key"
         private const val KEY_PROVIDER = "tunnel_provider"
         private const val KEY_CF_MODE = "cf_mode"
+        private const val KEY_CF_AUTO_URL = "cf_auto_url"
+        private const val KEY_CF_AUTO_SUBDOMAIN = "cf_auto_subdomain"
         private const val KEY_CF_WORKER_URL = "cf_worker_url"
         private const val KEY_CF_ZT_URL = "cf_zt_url"
         private const val KEY_WORKER_SECRET = "cf_worker_secret_enc"
@@ -247,5 +326,34 @@ class TunnelManager private constructor(context: Context) {
             instance ?: synchronized(this) {
                 instance ?: TunnelManager(context).also { instance = it }
             }
+
+        fun recordTrafficIfInitialized(bytes: Long) {
+            instance?.cloudflareAdapter?.recordProxiedTraffic(bytes)
+        }
+
+        fun currentAutoPublicUrl(): String? =
+            instance?.config?.value?.autoPublicUrl?.takeIf { it.isNotBlank() }
+
+        fun currentAutoSubdomain(): String? =
+            instance?.config?.value?.autoSubdomain?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
+
+        fun extractAutoCloudflareSubdomain(urlOrHost: String): String? {
+            val cleaned = urlOrHost.trim().lowercase()
+                .removePrefix("https://")
+                .removePrefix("http://")
+                .substringBefore('/')
+                .substringBefore(':')
+                .trim()
+            if (cleaned.startsWith("pocketlink-") && cleaned.endsWith(".trycloudflare.com")) {
+                return cleaned.removeSuffix(".trycloudflare.com")
+            }
+            return null
+        }
+
+        fun isThisDeviceAutoPublicUrl(urlOrHost: String): Boolean {
+            val mySub = currentAutoSubdomain() ?: return false
+            val targetSub = extractAutoCloudflareSubdomain(urlOrHost) ?: return false
+            return targetSub.equals(mySub, ignoreCase = true)
+        }
     }
 }

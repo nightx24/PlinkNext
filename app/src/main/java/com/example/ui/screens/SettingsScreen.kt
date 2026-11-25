@@ -82,6 +82,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.model.AppSettingsState
 import com.example.data.model.AppThemeMode
 import com.example.data.model.NetworkRouteType
@@ -254,11 +255,13 @@ fun SettingsScreen(
                     )
 
                     SettingsPage.CONNECTION_DIAGNOSTICS -> ConnectionDiagnosticsSettingsContent(
+                        viewModel = viewModel,
                         activeHostLabel = activeHostLabel,
                         routeType = routeType,
                         onOpenHostSetup = onOpenHostSetup,
                         onOpenDiagnostics = onOpenDiagnostics,
                         onDisconnect = onDisconnect,
+                        onMessage = { msg -> scope.launch { snackbarHostState.showSnackbar(msg) } },
                     )
                 }
             }
@@ -291,6 +294,8 @@ private fun SettingsHubContent(
     val scope = rememberCoroutineScope()
     val colors = LocalPocketLinkColors.current
     val isDark = LocalPocketLinkDarkTheme.current
+    val tunnelStatus by viewModel.tunnelStatus.collectAsStateWithLifecycle()
+    val isTunnelRunning = tunnelStatus.isActive
     var revealed by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { revealed = true }
 
@@ -394,6 +399,24 @@ private fun SettingsHubContent(
                                 leadingIcon = { Icon(Icons.Rounded.BlurOn, contentDescription = null, modifier = Modifier.size(16.dp)) },
                                 label = { Text("Glass") },
                             )
+                            FilterChip(
+                                selected = settings.headerBlurEnabled,
+                                onClick = { viewModel.setHeaderBlurEnabled(!settings.headerBlurEnabled) },
+                                leadingIcon = { Icon(Icons.Rounded.BlurOn, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                                label = { Text("Header Blur") },
+                            )
+                            FilterChip(
+                                selected = isTunnelRunning,
+                                onClick = {
+                                    if (isTunnelRunning) {
+                                        viewModel.stopCloudflareTunnel()
+                                    } else {
+                                        viewModel.startCloudflareTunnel()
+                                    }
+                                },
+                                label = { Text(if (isTunnelRunning) "Cloudflare: Live" else "1-Click Cloudflare") },
+                                modifier = Modifier.testTag("hub_cloudflare_quick_chip"),
+                            )
                         }
                     }
                 }
@@ -412,7 +435,7 @@ private fun SettingsHubContent(
                     icon = Icons.Rounded.Palette,
                     tint = MaterialTheme.colorScheme.primary,
                     title = "Appearance & Theme",
-                    subtitle = "Light, Dark & AMOLED modes, Liquid Glass dock finish",
+                    subtitle = "Light, Dark & AMOLED modes, Liquid Glass & Header Blur",
                     badgeText = themeSummary,
                     onClick = { onSelectCategory(SettingsPage.APPEARANCE) },
                     testTag = "settings_cat_appearance",
@@ -516,9 +539,9 @@ private fun SettingsHubContent(
                 SettingsCategoryCard(
                     icon = Icons.Rounded.Wifi,
                     tint = colors.emerald,
-                    title = "Connection, Tailscale & Host",
-                    subtitle = "Saved servers, VPN hosting guide & troubleshooting logs",
-                    badgeText = routeType?.label ?: "Servers",
+                    title = "Connection, Cloudflare & Host",
+                    subtitle = "1-click Cloudflare tunnel, Tailscale guide & saved servers",
+                    badgeText = if (isTunnelRunning) "Tunnel Live" else (routeType?.label ?: "Servers"),
                     onClick = { onSelectCategory(SettingsPage.CONNECTION_DIAGNOSTICS) },
                     testTag = "settings_cat_connection",
                 )

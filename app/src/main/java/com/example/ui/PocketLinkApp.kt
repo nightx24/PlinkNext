@@ -240,6 +240,7 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
     }
 
     PocketLinkTheme(themeMode = settings.themeMode, amoled = settings.amoled) {
+        CompositionLocalProvider(com.example.ui.components.LocalHeaderBlurEnabled provides settings.headerBlurEnabled) {
         val currentOverlay = overlayStack.lastOrNull()
         val isNowPlayingActive = currentOverlay == OverlayRoute.NowPlaying
         val topNonPlayerOverlay = overlayStack.lastOrNull { it != OverlayRoute.NowPlaying }
@@ -342,6 +343,8 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                                     viewModel.connect(name, host, port, user, pass, id)
                                 },
                                 onQuickStartLocal = { viewModel.quickStartLocalDevice() },
+                                onQuickConnectCloudflare = { viewModel.quickConnectCloudflareTunnel() },
+                                hostPasswordProvider = { viewModel.resolveLocalHostPassword() },
                                 onToggleCloudflareTunnel = { turnOn ->
                                     if (turnOn) {
                                         viewModel.startCloudflareTunnel()
@@ -499,6 +502,10 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                                     if (activeApi == null) {
                                         viewModel.quickStartLocalDevice()
                                     }
+                                },
+                                onConnectCloudflare = {
+                                    overlayStack.clear()
+                                    viewModel.quickConnectCloudflareTunnel()
                                 },
                             )
                             is OverlayRoute.Settings -> SettingsScreen(
@@ -782,6 +789,7 @@ fun PocketLinkApp(viewModel: PocketLinkViewModel) {
                     }
                 }
             }
+        }
         }
     }
 }

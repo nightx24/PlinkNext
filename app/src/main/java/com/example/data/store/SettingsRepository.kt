@@ -65,6 +65,7 @@ class SettingsRepository(context: Context) {
             themeMode = themeMode,
             amoled = prefs[KEY_AMOLED] ?: false,
             useLiquidGlass = prefs[KEY_LIQUID_GLASS] ?: true,
+            headerBlurEnabled = prefs[KEY_HEADER_BLUR] ?: true,
             navigationOrder = navOrder,
             visibleNavigationItems = visibleNav,
             quickActions = quickActions,
@@ -124,6 +125,12 @@ class SettingsRepository(context: Context) {
     suspend fun setUseLiquidGlass(enabled: Boolean) {
         dataStore.edit { prefs ->
             prefs[KEY_LIQUID_GLASS] = enabled
+        }
+    }
+
+    suspend fun setHeaderBlurEnabled(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[KEY_HEADER_BLUR] = enabled
         }
     }
 
@@ -361,6 +368,7 @@ class SettingsRepository(context: Context) {
         private val KEY_THEME_MODE = stringPreferencesKey("theme_mode")
         private val KEY_AMOLED = booleanPreferencesKey("amoled")
         private val KEY_LIQUID_GLASS = booleanPreferencesKey("use_liquid_glass")
+        private val KEY_HEADER_BLUR = booleanPreferencesKey("header_blur_enabled")
         private val KEY_NAV_ORDER = stringPreferencesKey("nav_order")
         private val KEY_NAV_VISIBLE = stringSetPreferencesKey("nav_visible")
         private val KEY_QUICK_ACTIONS = stringPreferencesKey("quick_actions")

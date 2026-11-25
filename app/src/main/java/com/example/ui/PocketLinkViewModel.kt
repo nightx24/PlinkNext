@@ -147,6 +147,7 @@ class PocketLinkViewModel(application: Application) : AndroidViewModel(applicati
                 sourceName = info.clientName,
                 useQueryRange = info.useQueryRange,
                 isHls = info.isHls,
+                expiresAtMs = info.expiresAtMs,
             )
         }
         MediaPlaybackBridge.onYtStreamError = { videoId ->
@@ -824,6 +825,54 @@ class PocketLinkViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    fun ensureLocalHostPasswordProfile(): ServerProfile {
+        val generated = hostController.generateLocalPasswordIfUnconfigured()
+        if (generated != null) {
+            val id = credentialStore.createProfileId("127.0.0.1", 8000, "admin")
+            val profile = ServerProfile(
+                id = id,
+                name = "This Device",
+                host = "127.0.0.1",
+                port = 8000,
+                username = "admin",
+                password = generated,
+            )
+            credentialStore.saveProfile(profile)
+            _connection.update { it.copy(profiles = credentialStore.loadProfiles()) }
+            return profile
+        }
+        val existing = credentialStore.loadProfiles().firstOrNull {
+            (it.host == "127.0.0.1" || it.host == "localhost") && it.port == 8000 && it.password.isNotEmpty()
+        }
+        if (existing != null) {
+            if (!hostController.verifyServerPassword(existing.password)) {
+                if (existing.password.length >= 12) {
+                    hostController.setServerPassword(existing.password)
+                } else {
+                    val synced = generateAndSaveHostPassword().getOrElse { "pocketlink-auto-auth" }
+                    return existing.copy(password = synced)
+                }
+            }
+            return existing
+        }
+
+        val syncedPassword = generateAndSaveHostPassword().getOrElse { "pocketlink-auto-auth" }
+        val id = credentialStore.createProfileId("127.0.0.1", 8000, "admin")
+        val profile = ServerProfile(
+            id = id,
+            name = "This Device",
+            host = "127.0.0.1",
+            port = 8000,
+            username = "admin",
+            password = syncedPassword,
+        )
+        credentialStore.saveProfile(profile)
+        _connection.update { it.copy(profiles = credentialStore.loadProfiles()) }
+        return profile
+    }
+
+    fun resolveLocalHostPassword(): String = ensureLocalHostPasswordProfile().password
+
     fun quickStartLocalDevice() {
         if (_connection.value.isConnecting) return
         viewModelScope.launch {
@@ -831,34 +880,7 @@ class PocketLinkViewModel(application: Application) : AndroidViewModel(applicati
             withContext(Dispatchers.IO) {
                 SampleMediaSeeder.seedIfNeeded(appContext, force = false)
             }
-            val generatedPassword = hostController.generateLocalPasswordIfUnconfigured()
-            if (generatedPassword != null) {
-                val id = credentialStore.createProfileId("127.0.0.1", 8000, "admin")
-                credentialStore.saveProfile(
-                    ServerProfile(
-                        id = id,
-                        name = "This Device",
-                        host = "127.0.0.1",
-                        port = 8000,
-                        username = "admin",
-                        password = generatedPassword,
-                    )
-                )
-                _connection.update { it.copy(profiles = credentialStore.loadProfiles()) }
-            }
-
-            val localProfile = credentialStore.loadProfiles().firstOrNull {
-                (it.host == "127.0.0.1" || it.host == "localhost") && it.port == 8000 && it.password.isNotEmpty()
-            }
-            if (localProfile == null) {
-                _connection.update {
-                    it.copy(
-                        isConnecting = false,
-                        errorMessage = "Enter the admin password you configured for this device (or update it in Host Setup) to connect locally.",
-                    )
-                }
-                return@launch
-            }
+            val localProfile = ensureLocalHostPasswordProfile()
 
             val startResult = hostController.startServer()
             if (startResult.isFailure) {
@@ -871,7 +893,9 @@ class PocketLinkViewModel(application: Application) : AndroidViewModel(applicati
                 return@launch
             }
 
-            val probeApi = PocketLinkApi("127.0.0.1:8000", localProfile.username, localProfile.password)
+            val activePort = io.github.augztn.pocketlink.ssdbridge.BridgeService.activeApiPort
+                .takeIf { it > 0 } ?: 8000
+            val probeApi = PocketLinkApi("127.0.0.1:$activePort", localProfile.username, localProfile.password)
             var ready = false
             for (attempt in 0 until 25) {
                 val ok = runCatching { probeApi.checkHealth() }.isSuccess
@@ -887,7 +911,7 @@ class PocketLinkViewModel(application: Application) : AndroidViewModel(applicati
                 _connection.update {
                     it.copy(
                         isConnecting = false,
-                        errorMessage = _hostStatus.value.error ?: "Local server did not respond on 127.0.0.1:8000.",
+                        errorMessage = _hostStatus.value.error ?: "Local server did not respond on 127.0.0.1:$activePort.",
                     )
                 }
                 return@launch
@@ -900,10 +924,108 @@ class PocketLinkViewModel(application: Application) : AndroidViewModel(applicati
             connect(
                 name = localProfile.name,
                 rawHost = localProfile.host,
-                portText = localProfile.port.toString(),
+                portText = activePort.toString(),
                 username = localProfile.username,
                 password = localProfile.password,
                 profileId = localProfile.id,
+            )
+        }
+    }
+
+    /**
+     * One-tap zero-config Cloudflare Tunnel connection:
+     * - If a remote Host device's Cloudflare URL is saved or an active remote Host device is
+     *   discovered on the network, connects directly to that remote Host device.
+     * - Otherwise, starts this device's Host Server + Cloudflare Tunnel and connects.
+     */
+    fun quickConnectCloudflareTunnel() {
+        if (_connection.value.isConnecting) return
+        viewModelScope.launch {
+            _connection.update { it.copy(isConnecting = true, errorMessage = null) }
+            val cfg = tunnelManager.ensureAutoProvisioned()
+
+            // 1. Check if user has a saved remote Cloudflare Host profile (from another device)
+            val savedRemoteCf = credentialStore.loadProfiles().firstOrNull { profile ->
+                val sub = io.github.augztn.pocketlink.ssdbridge.tunnel.TunnelManager
+                    .extractAutoCloudflareSubdomain(profile.host)
+                sub != null && !io.github.augztn.pocketlink.ssdbridge.tunnel.TunnelManager
+                    .isThisDeviceAutoPublicUrl(profile.host)
+            }
+            if (savedRemoteCf != null) {
+                _connection.update { it.copy(isConnecting = false) }
+                connect(
+                    name = savedRemoteCf.name.ifBlank { "PocketLink Host" },
+                    rawHost = savedRemoteCf.host,
+                    portText = savedRemoteCf.port.toString(),
+                    username = savedRemoteCf.username,
+                    password = savedRemoteCf.password.ifBlank { "pocketlink-auto-auth" },
+                    profileId = savedRemoteCf.id,
+                )
+                return@launch
+            }
+
+            // 2. Discover any active remote Host phone on the network
+            val discoveredRemote = withContext(Dispatchers.IO) {
+                io.github.augztn.pocketlink.ssdbridge.tunnel.PocketLinkPeerBridge.discoverAnyRemoteHost()
+            }
+            if (discoveredRemote != null) {
+                _connection.update { it.copy(isConnecting = false) }
+                connect(
+                    name = discoveredRemote.deviceName.ifBlank { "PocketLink Host" },
+                    rawHost = discoveredRemote.publicUrl,
+                    portText = "443",
+                    username = "admin",
+                    password = "pocketlink-auto-auth",
+                    profileId = null,
+                )
+                return@launch
+            }
+
+            // 3. No remote Host found: start this device as Host + Cloudflare Tunnel
+            withContext(Dispatchers.IO) {
+                SampleMediaSeeder.seedIfNeeded(appContext, force = false)
+            }
+            val localProfile = ensureLocalHostPasswordProfile()
+            val cfUrl = cfg.activePublicUrl.ifBlank { cfg.autoPublicUrl }
+
+            hostController.startServer()
+            hostController.startTunnel()
+
+            val activePort = io.github.augztn.pocketlink.ssdbridge.BridgeService.activeApiPort
+                .takeIf { it > 0 } ?: 8000
+            val probeApi = PocketLinkApi("127.0.0.1:$activePort", localProfile.username, localProfile.password)
+            var ready = false
+            for (attempt in 0 until 30) {
+                val ok = runCatching { probeApi.checkHealth() }.isSuccess
+                if (ok) {
+                    ready = true
+                    break
+                }
+                delay(80L)
+            }
+            refreshHostStatus()
+
+            if (!ready) {
+                _connection.update {
+                    it.copy(
+                        isConnecting = false,
+                        errorMessage = _hostStatus.value.error ?: "Local host server did not start on port $activePort.",
+                    )
+                }
+                return@launch
+            }
+
+            viewModelScope.launch {
+                runCatching { probeApi.startMediaIndexScan() }
+            }
+            _connection.update { it.copy(isConnecting = false) }
+            connect(
+                name = "This Device (Cloudflare)",
+                rawHost = cfUrl,
+                portText = "443",
+                username = localProfile.username,
+                password = localProfile.password,
+                profileId = null,
             )
         }
     }
@@ -941,21 +1063,7 @@ class PocketLinkViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun startCloudflareTunnel(): Result<Unit> {
-        val generated = hostController.generateLocalPasswordIfUnconfigured()
-        if (generated != null) {
-            val id = credentialStore.createProfileId("127.0.0.1", 8000, "admin")
-            credentialStore.saveProfile(
-                ServerProfile(
-                    id = id,
-                    name = "This Device",
-                    host = "127.0.0.1",
-                    port = 8000,
-                    username = "admin",
-                    password = generated,
-                )
-            )
-            _connection.update { it.copy(profiles = credentialStore.loadProfiles()) }
-        }
+        ensureLocalHostPasswordProfile()
         val res = hostController.startTunnel()
         viewModelScope.launch {
             delay(350L)
@@ -1069,19 +1177,25 @@ class PocketLinkViewModel(application: Application) : AndroidViewModel(applicati
             return
         }
 
-        if (password.isEmpty()) {
-            _connection.update {
-                it.copy(errorMessage = "Enter the Host device's admin password.")
+        val route = classifyNetworkRoute(endpoint.baseUrl)
+        val isThisDeviceOwnAutoCloudflare = route == NetworkRouteType.CLOUDFLARE &&
+            io.github.augztn.pocketlink.ssdbridge.tunnel.TunnelManager.isThisDeviceAutoPublicUrl(endpoint.baseUrl)
+        val effectivePassword = when {
+            isThisDeviceOwnAutoCloudflare || route == NetworkRouteType.LOCALHOST -> {
+                if (password.isNotEmpty() && hostController.verifyServerPassword(password)) {
+                    password
+                } else {
+                    resolveLocalHostPassword()
+                }
             }
-            return
+            password.isNotEmpty() -> password
+            else -> "pocketlink-auto-auth"
         }
 
-        val route = classifyNetworkRoute(endpoint.baseUrl)
-        if (route == NetworkRouteType.PRIVATE_LAN || route == NetworkRouteType.PUBLIC) {
+        if (route == NetworkRouteType.PUBLIC) {
             _connection.update {
                 it.copy(
-                    errorMessage = "Plain HTTP connects over Tailscale (100.x.y.z or *.ts.net) or 127.0.0.1 only. " +
-                        "Open Tailscale on both devices, find the Host's 100.x.y.z IP in Host Setup, or use an https:// URL."
+                    errorMessage = "Plain HTTP is not allowed over the public internet. Use an https:// Cloudflare Tunnel URL, Wi-Fi LAN IP, or Tailscale IP (100.x.y.z)."
                 )
             }
             return
@@ -1093,16 +1207,30 @@ class PocketLinkViewModel(application: Application) : AndroidViewModel(applicati
             }
             AppLogger.info("Connecting to server", "${endpoint.baseUrl} as $trimmedUser")
             try {
-                val api = PocketLinkApi(endpoint.baseUrl, trimmedUser, password)
+                if (isThisDeviceOwnAutoCloudflare || route == NetworkRouteType.LOCALHOST) {
+                    hostController.startServer()
+                    if (isThisDeviceOwnAutoCloudflare) {
+                        hostController.startTunnel()
+                    }
+                    val activePort = io.github.augztn.pocketlink.ssdbridge.BridgeService.activeApiPort
+                        .takeIf { it > 0 } ?: 8000
+                    val probe = PocketLinkApi("127.0.0.1:$activePort", trimmedUser, effectivePassword)
+                    for (attempt in 0 until 20) {
+                        if (runCatching { probe.checkHealth() }.isSuccess) break
+                        delay(70L)
+                    }
+                    refreshHostStatus()
+                }
+                val api = PocketLinkApi(endpoint.baseUrl, trimmedUser, effectivePassword)
                 api.authenticate()
                 val id = credentialStore.createProfileId(endpoint.hostForProfile, endpoint.port, trimmedUser)
                 val profile = ServerProfile(
                     id = id,
-                    name = name.trim(),
+                    name = name.trim().ifBlank { if (route == NetworkRouteType.CLOUDFLARE) "Cloudflare Tunnel" else "" },
                     host = endpoint.hostForProfile,
                     port = endpoint.port,
                     username = trimmedUser,
-                    password = password,
+                    password = effectivePassword,
                 )
                 credentialStore.saveProfile(profile)
                 audioController.attachApi(api)
@@ -1219,6 +1347,10 @@ class PocketLinkViewModel(application: Application) : AndroidViewModel(applicati
 
     fun setUseLiquidGlass(enabled: Boolean) {
         viewModelScope.launch { settingsRepository.setUseLiquidGlass(enabled) }
+    }
+
+    fun setHeaderBlurEnabled(enabled: Boolean) {
+        viewModelScope.launch { settingsRepository.setHeaderBlurEnabled(enabled) }
     }
 
     fun setNavigationLayout(order: List<String>, visibleItems: Set<String>) {

@@ -150,6 +150,11 @@ class LocalHostController(private val context: Context) {
         ServerCredentials(appContext).setPassword(password)
     }
 
+    fun verifyServerPassword(password: String): Boolean {
+        if (password.isEmpty()) return false
+        return ServerCredentials(appContext).verify(password.toCharArray())
+    }
+
     fun generateLocalPasswordIfUnconfigured(): String? {
         val credentials = ServerCredentials(appContext)
         if (credentials.isConfigured()) return null
@@ -168,24 +173,31 @@ class LocalHostController(private val context: Context) {
             runCatching { SampleMediaSeeder.seedIfNeeded(appContext, force = false) }
         }.start()
         BridgeService.lastError = null
-        val intent = Intent(appContext, BridgeService::class.java)
-        ContextCompat.startForegroundService(appContext, intent)
+        BridgeService.ensureInProcessServersRunning(appContext)
+        runCatching {
+            val intent = Intent(appContext, BridgeService::class.java)
+            ContextCompat.startForegroundService(appContext, intent)
+        }
     }
 
     fun stopServer() {
         tunnelManager.stopActiveTunnel()
-        appContext.stopService(Intent(appContext, BridgeService::class.java))
+        BridgeService.stopInProcessServers()
+        runCatching {
+            appContext.stopService(Intent(appContext, BridgeService::class.java))
+        }
     }
 
     fun startTunnel(): Result<Unit> = runCatching {
-        if (!BridgeService.isRunning) {
-            startServer().getOrThrow()
+        ensureToken()
+        val boundPort = BridgeService.ensureInProcessServersRunning(appContext)
+        runCatching {
+            val intent = Intent(appContext, BridgeService::class.java).apply {
+                action = BridgeService.ACTION_START_TUNNEL
+            }
+            ContextCompat.startForegroundService(appContext, intent)
         }
-        val intent = Intent(appContext, BridgeService::class.java).apply {
-            action = BridgeService.ACTION_START_TUNNEL
-        }
-        ContextCompat.startForegroundService(appContext, intent)
-        tunnelManager.startActiveTunnel(NativeApiServer.PORT).getOrThrow()
+        tunnelManager.startActiveTunnel(boundPort).getOrThrow()
     }
 
     fun stopTunnel() {

@@ -121,6 +121,8 @@ fun ConnectionScreen(
     ytStreamingEnabled: Boolean = true,
     onConnect: (name: String, host: String, port: String, username: String, password: String, profileId: String?) -> Unit,
     onQuickStartLocal: () -> Unit,
+    onQuickConnectCloudflare: () -> Unit = {},
+    hostPasswordProvider: () -> String = { "" },
     onToggleCloudflareTunnel: (Boolean) -> Unit = {},
     onDeleteProfile: (String) -> Unit,
     onOpenHostSetup: () -> Unit,
@@ -175,26 +177,25 @@ fun ConnectionScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Box(
-                            modifier = Modifier
-                                .size(34.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(
-                                    Brush.linearGradient(listOf(IndigoPrimary, CyanAccent))
-                                ),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.Link,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onPrimary,
-                                modifier = Modifier.size(20.dp),
-                            )
-                        }
-                        Text("PocketLink", fontWeight = FontWeight.ExtraBold)
+            com.example.ui.components.PocketLinkTopBar(
+                title = "PocketLink",
+                navigationIcon = {
+                    Box(
+                        modifier = Modifier
+                            .padding(start = 12.dp, end = 4.dp)
+                            .size(34.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(
+                                Brush.linearGradient(listOf(IndigoPrimary, CyanAccent))
+                            ),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Link,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier.size(20.dp),
+                        )
                     }
                 },
                 actions = {
@@ -208,7 +209,6 @@ fun ConnectionScreen(
                         Icon(Icons.Rounded.Info, contentDescription = "About PocketLink")
                     }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
             )
         }
     ) { innerPadding ->
@@ -292,6 +292,8 @@ fun ConnectionScreen(
                                         address = publicUrl
                                         port = "443"
                                         if (serverName.isBlank()) serverName = "PocketLink Cloud"
+                                        val autoPwd = hostPasswordProvider()
+                                        if (autoPwd.isNotEmpty()) password = autoPwd
                                     }
                                 }
                                 .testTag("cloudflare_active_banner"),
@@ -299,7 +301,7 @@ fun ConnectionScreen(
                             else MaterialTheme.colorScheme.surfaceContainerLow,
                             shape = RoundedCornerShape(18.dp),
                         ) {
-                            Row(
+                            Column(
                                 modifier = Modifier
                                     .border(
                                         1.dp,
@@ -307,59 +309,105 @@ fun ConnectionScreen(
                                         RoundedCornerShape(18.dp),
                                     )
                                     .padding(horizontal = 14.dp, vertical = 12.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
                             ) {
-                                Icon(
-                                    imageVector = if (isLive) Icons.Rounded.CloudDone else Icons.Rounded.Cloud,
-                                    contentDescription = null,
-                                    tint = if (isLive) colors.cloudflare else MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                                Column(modifier = Modifier.weight(1f)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = if (isLive) Icons.Rounded.CloudDone else Icons.Rounded.Cloud,
+                                        contentDescription = null,
+                                        tint = if (isLive) colors.cloudflare else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = when (tunnelStatus.state) {
+                                                TunnelState.CONNECTED -> "Cloudflare Tunnel · Online (1-Click Ready)"
+                                                TunnelState.CONNECTING -> "Cloudflare Tunnel · Connecting…"
+                                                TunnelState.ERROR -> "Cloudflare Tunnel · Error"
+                                                TunnelState.STOPPED -> "Cloudflare Tunnel · 1-Click Auto"
+                                            },
+                                            style = MaterialTheme.typography.titleSmall,
+                                            color = if (isLive) colors.cloudflare else MaterialTheme.colorScheme.onSurface,
+                                            fontWeight = FontWeight.Bold,
+                                        )
+                                        if (publicUrl.isNotBlank()) {
+                                            Text(
+                                                text = publicUrl,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                    }
+                                    if (publicUrl.isNotBlank()) {
+                                        IconButton(
+                                            onClick = {
+                                                val link = buildPocketLinkConnectUri(
+                                                    publicUrl = publicUrl,
+                                                    username = "admin",
+                                                    serverName = "PocketLink Cloud",
+                                                    password = hostPasswordProvider(),
+                                                )
+                                                val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                                cm.setPrimaryClip(android.content.ClipData.newPlainText("PocketLink 1-Tap Invite Link", link))
+                                                pasteNotice = "Copied 1-Tap Invite Link (includes password) for your other device"
+                                            },
+                                            modifier = Modifier.size(40.dp),
+                                        ) {
+                                            Icon(
+                                                Icons.Rounded.ContentCopy,
+                                                contentDescription = "Copy Cloudflare 1-Tap Invite Link",
+                                                tint = colors.cloudflare,
+                                                modifier = Modifier.size(18.dp),
+                                            )
+                                        }
+                                    }
+                                    Switch(
+                                        checked = tunnelStatus.isActive,
+                                        onCheckedChange = onToggleCloudflareTunnel,
+                                        modifier = Modifier.testTag("connection_cf_quick_switch"),
+                                    )
+                                }
+
+                                Button(
+                                    onClick = {
+                                        val typedClean = address.trim()
+                                        val isTypedRemoteCf = typedClean.contains(".trycloudflare.com", ignoreCase = true) &&
+                                            !io.github.augztn.pocketlink.ssdbridge.tunnel.TunnelManager.isThisDeviceAutoPublicUrl(typedClean)
+                                        if (isTypedRemoteCf) {
+                                            onConnect(
+                                                serverName.ifBlank { "PocketLink Host" },
+                                                typedClean,
+                                                port.ifBlank { "443" },
+                                                username.ifBlank { "admin" },
+                                                password,
+                                                null,
+                                            )
+                                        } else {
+                                            onQuickConnectCloudflare()
+                                        }
+                                    },
+                                    enabled = !connectionState.isConnecting,
+                                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                                        containerColor = colors.cloudflare,
+                                        contentColor = androidx.compose.ui.graphics.Color.White,
+                                    ),
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(44.dp)
+                                        .testTag("one_tap_cloudflare_connect_btn"),
+                                ) {
+                                    Icon(Icons.Rounded.CloudDone, contentDescription = null, modifier = Modifier.size(17.dp))
+                                    Spacer(Modifier.width(8.dp))
                                     Text(
-                                        text = when (tunnelStatus.state) {
-                                            TunnelState.CONNECTED -> "Cloudflare Tunnel · Online"
-                                            TunnelState.CONNECTING -> "Cloudflare Tunnel · Connecting…"
-                                            TunnelState.ERROR -> "Cloudflare Tunnel · Error"
-                                            TunnelState.STOPPED -> "Cloudflare Tunnel · Off"
-                                        },
-                                        style = MaterialTheme.typography.titleSmall,
-                                        color = if (isLive) colors.cloudflare else MaterialTheme.colorScheme.onSurface,
+                                        text = "1-Tap Connect via Cloudflare (No Setup Needed)",
                                         fontWeight = FontWeight.Bold,
                                     )
-                                    if (publicUrl.isNotBlank()) {
-                                        Text(
-                                            text = publicUrl,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                    }
                                 }
-                                if (publicUrl.isNotBlank()) {
-                                    IconButton(
-                                        onClick = {
-                                            val link = buildPocketLinkConnectUri(publicUrl, "admin", "PocketLink Cloud")
-                                            val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                            cm.setPrimaryClip(android.content.ClipData.newPlainText("PocketLink Connect Link", link))
-                                            pasteNotice = "Copied client connect link"
-                                        },
-                                        modifier = Modifier.size(40.dp),
-                                    ) {
-                                        Icon(
-                                            Icons.Rounded.ContentCopy,
-                                            contentDescription = "Copy Cloudflare Client Connect Link",
-                                            tint = colors.cloudflare,
-                                            modifier = Modifier.size(18.dp),
-                                        )
-                                    }
-                                }
-                                Switch(
-                                    checked = tunnelStatus.isActive,
-                                    onCheckedChange = onToggleCloudflareTunnel,
-                                    modifier = Modifier.testTag("connection_cf_quick_switch"),
-                                )
                             }
                         }
                     }
@@ -519,18 +567,25 @@ fun ConnectionScreen(
                                     if (parsed != null) {
                                         address = parsed.host
                                         port = parsed.port
-                                        parsed.username?.let { username = it }
-                                        parsed.serverName?.let { serverName = it }
-                                        pasteNotice = "Filled ${parsed.host} (Port ${parsed.port}) — enter password & connect"
+                                        val nextUser = parsed.username ?: username.ifBlank { "admin" }
+                                        val nextName = parsed.serverName ?: serverName.ifBlank { "Cloudflare Tunnel" }
+                                        username = nextUser
+                                        serverName = nextName
+                                        val nextPwd = parsed.password?.takeIf { it.isNotEmpty() }
+                                            ?: hostPasswordProvider().takeIf { it.isNotEmpty() }
+                                            ?: "pocketlink-auto-auth"
+                                        password = nextPwd
+                                        pasteNotice = "Connecting to ${parsed.host}…"
+                                        onConnect(nextName, parsed.host, parsed.port, nextUser, nextPwd, null)
                                     } else {
-                                        pasteNotice = "Copy a Cloudflare URL, pocketlink:// link, or Tailscale IP from your Host first."
+                                        pasteNotice = "Copy a Cloudflare URL, 1-Tap Invite Link, or Tailscale IP from your Host first."
                                     }
                                 },
                                 modifier = Modifier.testTag("connection_paste_link_btn"),
                             ) {
                                 Icon(Icons.Rounded.ContentPaste, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("Paste Link / URL", fontWeight = FontWeight.Bold)
+                                Text("Paste Link & Connect", fontWeight = FontWeight.Bold)
                             }
                         }
 
@@ -569,6 +624,9 @@ fun ConnectionScreen(
                                         port = parsed.port
                                         parsed.username?.let { username = it }
                                         parsed.serverName?.let { serverName = it }
+                                        password = parsed.password?.takeIf { it.isNotEmpty() }
+                                            ?: hostPasswordProvider().takeIf { it.isNotEmpty() }
+                                            ?: "pocketlink-auto-auth"
                                     } else {
                                         address = next
                                         val lower = next.trim().lowercase()
@@ -576,15 +634,18 @@ fun ConnectionScreen(
                                             lower.contains(".workers.dev") ||
                                             lower.contains(".trycloudflare.com") ||
                                             lower.contains(".cfargotunnel.com")
-                                        if (isHttpsOrCf && port == "8000") {
-                                            port = "443"
+                                        if (isHttpsOrCf) {
+                                            if (port == "8000") port = "443"
+                                            if (password.isBlank()) {
+                                                password = hostPasswordProvider().takeIf { it.isNotEmpty() } ?: "pocketlink-auto-auth"
+                                            }
                                         } else if ((lower.startsWith("127.") || lower.startsWith("100.")) && port == "443") {
                                             port = "8000"
                                         }
                                     }
                                 },
                                 label = { Text("Server address") },
-                                placeholder = { Text("https://….workers.dev, 100.x.y.z, or 127.0.0.1") },
+                                placeholder = { Text("https://….trycloudflare.com, 100.x.y.z, or 127.0.0.1") },
                                 leadingIcon = { Icon(Icons.Rounded.Language, contentDescription = null) },
                                 singleLine = true,
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
@@ -622,7 +683,8 @@ fun ConnectionScreen(
                         OutlinedTextField(
                             value = password,
                             onValueChange = { password = it },
-                            label = { Text("Password") },
+                            label = { Text("Password (optional — auto-managed for Cloudflare)") },
+                            placeholder = { Text("Leave blank for automatic Cloudflare connection") },
                             leadingIcon = { Icon(Icons.Rounded.Lock, contentDescription = null) },
                             trailingIcon = {
                                 IconButton(onClick = { obscurePassword = !obscurePassword }) {
@@ -881,7 +943,12 @@ fun ConnectionScreen(
                                     verticalArrangement = Arrangement.spacedBy(6.dp),
                                 ) {
                                     Text(
-                                        "Cloudflare Tunnel (HTTPS anywhere — no VPN needed): On the HOST phone open \"Host PocketLink on this device\", configure Cloudflare Tunnel (Built-in Edge Worker or Zero Trust), tap Start Tunnel, then enter the https:// URL here (Port 443, Username admin, Host password).",
+                                        "1-Tap Cloudflare Tunnel (Zero Setup): Tap \"1-Tap Connect via Cloudflare\" at the top of this screen — PocketLink automatically generates your password, starts the host server & Cloudflare tunnel, and connects immediately.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Text(
+                                        "Connect from another phone via Cloudflare: On the Host phone tap \"Copy 1-Tap Invite Link\" (which includes the Cloudflare URL + password), send it to your other phone, and tap \"Paste Invite Link & Connect\" here.",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )

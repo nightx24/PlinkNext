@@ -91,6 +91,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.model.AppSettingsState
 import com.example.data.model.AppThemeMode
 import com.example.data.model.NetworkRouteType
@@ -151,6 +152,16 @@ internal fun AppearanceSettingsContent(
                         subtitle = "Frosted glass finish on floating dock, mini-player & shortcut pills",
                         checked = settings.useLiquidGlass,
                         onCheckedChange = { viewModel.setUseLiquidGlass(it) },
+                    )
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+                    ToggleRow(
+                        icon = Icons.Rounded.BlurOn,
+                        iconTint = colors.teal,
+                        title = "Header Blur",
+                        subtitle = "Transparent top header bar with customizable frosted blur on or off in the header section only",
+                        checked = settings.headerBlurEnabled,
+                        switchTestTag = "header_blur_switch",
+                        onCheckedChange = { viewModel.setHeaderBlurEnabled(it) },
                     )
                 }
             }
@@ -1122,13 +1133,21 @@ internal fun YtStreamingSettingsContent(
 
 @Composable
 internal fun ConnectionDiagnosticsSettingsContent(
+    viewModel: PocketLinkViewModel,
     activeHostLabel: String?,
     routeType: NetworkRouteType?,
     onOpenHostSetup: () -> Unit,
     onOpenDiagnostics: () -> Unit,
     onDisconnect: () -> Unit,
+    onMessage: (String) -> Unit = {},
 ) {
     val colors = LocalPocketLinkColors.current
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    val tunnelStatus by viewModel.tunnelStatus.collectAsStateWithLifecycle()
+    val tunnelConfig by viewModel.tunnelConfig.collectAsStateWithLifecycle()
+    val isTunnelActive = tunnelStatus.isActive
+    val activeEndpointUrl = tunnelStatus.publicUrl ?: tunnelConfig.activePublicUrl
+
     LazyColumn(
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -1164,6 +1183,48 @@ internal fun ConnectionDiagnosticsSettingsContent(
                         if (routeType != null) {
                             RouteBadge(routeType)
                         }
+                    }
+                }
+            }
+        }
+
+        item {
+            SettingsSectionCard(title = "Cloudflare Tunnel (1-Click Auto)") {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    ToggleRow(
+                        icon = Icons.Rounded.Public,
+                        iconTint = Color(0xFFF38020),
+                        title = "Cloudflare Auto Tunnel",
+                        subtitle = if (isTunnelActive) {
+                            val raySuffix = tunnelStatus.cloudflareRay?.let { " · Ray $it" }.orEmpty()
+                            "${tunnelStatus.state.label}$raySuffix"
+                        } else {
+                            "Single-click zero-config tunnel — auto-handles auth, token & edge registration"
+                        },
+                        checked = isTunnelActive,
+                        switchTestTag = "settings_cloudflare_auto_switch",
+                        onCheckedChange = { enabled: Boolean ->
+                            if (enabled) {
+                                viewModel.startCloudflareTunnel()
+                                onMessage("Cloudflare Tunnel auto-provisioned & starting")
+                            } else {
+                                viewModel.stopCloudflareTunnel()
+                                onMessage("Cloudflare Tunnel stopped")
+                            }
+                        },
+                    )
+                    if (activeEndpointUrl.isNotBlank()) {
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+                        SettingsActionRow(
+                            icon = Icons.Rounded.Bolt,
+                            iconTint = colors.emerald,
+                            title = activeEndpointUrl,
+                            subtitle = "Tap to copy auto-configured Cloudflare HTTPS URL",
+                            onClick = {
+                                clipboard.setText(androidx.compose.ui.text.AnnotatedString(activeEndpointUrl))
+                                onMessage("Copied Cloudflare URL: $activeEndpointUrl")
+                            },
+                        )
                     }
                 }
             }
